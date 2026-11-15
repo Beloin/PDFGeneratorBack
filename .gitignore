@@ -1,0 +1,12 @@
+.heph/
+target/
+dist/
+/tmp/
+data/
+.venv/
+__pycache__/
+*.pyc
+*.pdf
+*.pdf.manifest.json
+chat/.env
+chat/.env.claude

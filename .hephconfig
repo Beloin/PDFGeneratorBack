@@ -1,0 +1,12 @@
+plugins:
+  - builtin: buildfile
+  - builtin: exec
+    options:
+      coreutils: true
+  - builtin: bash
+    options:
+      coreutils: true
+  - url: https://github.com/hephbuild/heph-artifacts-v1/releases/download/v1.0.0-alpha-build.435.2078+ga1ab80ec/heph-go-plugin.json
+    checksum: sha256:f8e3b62491ecb8b7cc2911261329a2f0dac6f9fd4e46f714572b497816ce3fa9
+    options:
+      gotool: "host"

@@ -1,0 +1,48 @@
+@startuml
+title Chat-Edited PDF Generator — current component architecture
+skinparam componentStyle rectangle
+skinparam defaultFontName Helvetica
+
+cloud "Ollama\n:11434" as ollama
+artifact "PDF output\nout.pdf + manifest.json" as pdf
+
+package "web/ (React)" {
+    component "Viewer + chat panel" as web <<planned>>
+}
+
+package "chat/ (Rust axum :3000)" {
+    component "routes\n/health /tools /call /chat" as routes
+    component "LLM client\nOpenAI-compatible" as llm
+    component "MCP client\n(rmcp)" as mcpclient
+}
+
+package "server/ (Go :8080)" {
+    component "MCP server\n/mcp streamable HTTP" as mcpsrv
+    component "REST API\n/docs" as rest
+    component "Store\n(in-memory)" as store
+    component "Runner\nsubprocess" as runner
+}
+
+package "gen/ (Python)" {
+    component "run.py\nrunner" as runpy
+    component "doc.py\nDoc wrapper" as docpy
+}
+
+web ..> routes : "REST + SSE (planned)"
+routes --> llm : "complete()"
+routes --> mcpclient : "list/call tools"
+llm --> ollama : "POST /v1/chat/completions"
+mcpclient --> mcpsrv : "MCP streamable HTTP"
+rest --> store
+mcpsrv --> store
+mcpsrv --> runner
+rest --> runner
+runner --> runpy : "python3 run.py"
+runpy --> docpy : "imports"
+runpy ..> pdf : "writes"
+
+note bottom of mcpsrv
+  7 tools: get_script, get_element, edit_script,
+  run_script, list_versions, restore_version, list_elements
+end note
+@enduml
