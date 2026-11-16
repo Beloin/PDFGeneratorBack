@@ -1,6 +1,16 @@
-# Project Plan: Chat-Edited PDF Generator
+# Design plan: Chat-Edited PDF Generator
 
-> Drop this file in the repo root (as `PLAN.md`, or merge the "Conventions" and "Architecture" sections into `CLAUDE.md`). Work phase by phase; do not start a phase before the previous one's acceptance criteria pass.
+This is the original design proposal and decision log. Sections below describe planned behavior, including features that are not implemented. For the current system, use [architecture](architecture.md), [API contract](backend-api.md), and [frontend guide](frontend-guide.md).
+
+## Current implementation snapshot
+
+- Go owns REST, MCP, WebSocket events, versioned scripts, drafts, PDF rendering, and manifests. It uses `mark3labs/mcp-go` and a key-based `DriverFS` store under repo `tmp/`. A future driver can use S3 or GCP.
+- Rust uses `rmcp` and an OpenAI-compatible client for a working model/tool loop. It can persist chat in Postgres. `/chat` returns one JSON object; SSE, token streaming, auth forwarding, and per-user isolation are still proposed.
+- Python uses ReportLab and `svglib` through `Doc`. It runs as a local subprocess with a timeout and reduced environment; a public-use sandbox is still proposed.
+- The browser frontend is outside this repository. Go sends PDF updates over WebSocket. The chat request accepts `selection: {element_id, page, bbox}`; element text and cropped images are still proposed.
+- Template files seed once under `tmp/templates/`; projects are created on demand under `tmp/pdf/{id}/`. Each project keeps scripts, manifests, PDFs, and SVGs together. Rust alone uses Postgres for optional chat history.
+
+The original phase checklist and examples below remain as planning history. They are not acceptance claims for the current code.
 
 ## 1. Goal
 

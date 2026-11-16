@@ -1,262 +1,122 @@
-# Backend API — contract for the frontend
+# Backend API
 
-Two servers. The frontend talks to both.
+The browser uses Go REST and WebSocket on `:8080`, plus Rust chat on `:3000`. Rust calls Go MCP at `/mcp`. See [architecture](architecture.md) for storage and lifecycle.
 
-| Server | Addr | Purpose |
+## Templates and projects (Go REST)
+
+| Method | Path | Behavior |
 |---|---|---|
-| Go main server | `:8080` | Source of truth. REST (`/docs`) + MCP (`/mcp`) + WebSocket (`/ws`). |
-| Rust chat harness | `:3000` | Chat. Talks to the LLM and to the Go server over MCP. |
+| `GET` | `/templates` | Return `{"templates":[{"id":"empty","name":"Blank","cover_url":"/templates/empty/cover"}, ...]}`. Bundled IDs: `empty`, `report`, `slideshow`, `business`, `metrics`. |
+| `POST` | `/docs` | Accept `{"template":"report","title":"My report"}`. Template defaults to `empty`; title defaults to its display name. Render version 1 before returning `201` project metadata. |
+| `GET` | `/docs` | Return `{"docs":[...]}`, newest `updated_at` first. Pending initial renders are omitted. |
+| `GET` | `/docs/{id}` | Return one project's metadata. |
+| `PATCH` | `/docs/{id}` | Accept `{"title":"New title"}` and return updated metadata. Trim titles; require 1–120 Unicode characters. |
+| `DELETE` | `/docs/{id}` | Delete project scripts, PDFs, manifests, and assets. Return `204`. Rust chat history is retained. |
+| `GET` | `/docs/{id}/pdf?version=N` | Return `application/pdf`. Version defaults to the current head. |
+| `GET` | `/templates/{id}/cover` | Return the template’s first page as `image/png`. |
+| `GET` | `/docs/{id}/cover?version=N` | Return the version’s first page as `image/png`; rebuild missing output for previously rendered versions. |
+| `GET` | `/docs/{id}/manifest?version=N` | Return a version's manifest. Version defaults to the head. |
+| `GET` | `/docs/{id}/versions` | Return version records oldest first, including scripts and output metadata. |
+| `POST` | `/docs/{id}/restore` | Accept `{"version":N}`. Copy that script into the draft; call MCP `render` to commit. |
+| `GET` | `/health` | Return `{"ok":true}`. |
 
-The frontend does **not** talk MCP directly. It uses REST (`/docs`) for reads,
-the WebSocket (`/ws`) for change events, and the Rust harness (`/chat`) for the
-assistant.
-
-Rendering is **assistant-driven**: `edit_script` only saves a draft (no version
-bump, no render). The assistant calls the `render` MCP tool to commit the draft
-as a new version and generate the PDF synchronously. During a render the server
-pushes `updating_pdf` → `pdf_updated` (or `pdf_failed`) over the WebSocket. The
-frontend never asks for a render.
-
----
-
-## 1. Go server — REST (`:8080`)
-
-Auth: all `/docs` routes accept an optional `Authorization: Bearer <token>`.
-Only enforced when the server is started with `AUTH_TOKEN` set. Dev default:
-unset, so no header needed.
-
-### Create a document
-
-```bash
-curl -X POST localhost:8080/docs \
-  -H 'Content-Type: application/json' \
-  -d '{"template":"report"}'      # or "empty"; defaults to "empty" when omitted
-```
-
-```json
-201 {"doc_id":"doc-1","version":1}
-```
-
-`template` names a **server-side** script. The frontend never sends script
-text. Two seeded documents are always available for testing: `1` (report) and
-`2` (slideshow, 16:9).
-
-### Error envelope
-
-REST errors carry a machine-readable `code`:
-
-```json
-{"error":"version 1 has no rendered manifest yet; run it first","code":"NO_MANIFEST"}
-```
-
-`code` is `ERROR` when no specific code applies.
-
-### List versions
-
-```bash
-curl localhost:8080/docs/doc-1/versions
-```
-
-```json
-{"doc_id":"doc-1","versions":[{"version":1,"created_at":"..."},{"version":2,"created_at":"..."}]}
-```
-
-### Get the manifest (element list)
-
-```bash
-curl localhost:8080/docs/doc-1/manifest
-```
+Project metadata shape:
 
 ```json
 {
-  "doc_id":"doc-1",
-  "page_size":[595.2755905511812,841.8897637795277],
-  "elements":[{"id":"title","type":"heading","page":1,"bbox":[78.0,741.89,517.28,763.89],"line":5}]
+  "doc_id": "PROJECT_ID",
+  "title": "My report",
+  "template": "report",
+  "version": 1,
+  "rendered_version": 1,
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z",
+  "pdf_url": "/docs/PROJECT_ID/pdf?version=1",
+  "cover_url": "/docs/PROJECT_ID/cover?version=1",
+  "manifest_url": "/docs/PROJECT_ID/manifest?version=1"
 }
 ```
 
-### Get the PDF
+`version` is the script head; `rendered_version` is the latest successful render. After a failed later render, PDF and manifest URLs point to `rendered_version`. `POST /docs` removes the project if its first render fails and returns `500`. Invalid input returns `400`; unknown projects return `404`. REST errors use `{"error":"...","code":"ERROR"}`. A version without a rendered manifest returns `409` with `code: "NO_MANIFEST"`. The Go REST routes check `Authorization: Bearer <token>` only when `AUTH_TOKEN` is set. MCP and WebSocket do not use that check.
 
-```bash
-curl -o doc.pdf localhost:8080/docs/doc-1/pdf              # head version
-curl -o doc.pdf "localhost:8080/docs/doc-1/pdf?version=2"  # specific version
-```
+If a version has a manifest but its PDF object is missing, PDF GET rebuilds it from its saved script and asset snapshot. If no manifest exists, it returns `404`; rebuild failure returns `500`.
 
-Serves `application/pdf`; `?version=` optional (defaults to head).
-
-### Restore an older version (undo)
-
-```bash
-curl -X POST localhost:8080/docs/doc-1/restore \
-  -H 'Content-Type: application/json' \
-  -d '{"version":1}'
-```
-
-```json
-{"doc_id":"doc-1","version":3}
-```
-
-Restore copies version 1 as a new head version (3), then re-renders (debounced).
-
-### Health
-
-```bash
-curl localhost:8080/health    # -> {"ok":true}
-```
-
-### Not on REST
-
-- **Script text** — read/write only over MCP, never REST.
-- **No run/render endpoint** — rendering is automatic after a script change.
-
----
-
-## 2. Manifest schema
-
-The manifest is the link between a clicked region and the code. The viewer
-draws clickable boxes from it.
-
-- `page_size`: `[width, height]` in PDF points (A4 = 595.28 x 841.89).
-- `elements[]`: one entry per element. An element split across pages appears
-  once per page, with the **same `id`**.
+### Manifest
 
 ```json
 {
-  "id": "sales-table",
-  "type": "table",          // heading | paragraph | table | spacer | page_break
-  "page": 2,
-  "bbox": [72, 310, 523, 540],
-  "line": 14
+  "doc_id": "PROJECT_ID",
+  "page_size": [595.28, 841.89],
+  "elements": [
+    {"id":"title","type":"heading","page":1,"bbox":[78,741.89,517.28,763.89],"line":5}
+  ]
 }
 ```
 
-`bbox` is `[x0, y0, x1, y1]` in PDF points, origin **bottom-left**. To place a
-CSS overlay, flip y first: `y_css = page_height - y_pdf`, then scale by zoom.
+`bbox` is `[x0, y0, x1, y1]` in PDF points, origin bottom-left. Element types include `heading`, `paragraph`, `table`, `spacer`, `page_break`, `svg`, and `image`. A split element has one entry per part under the same ID.
 
----
+## Go MCP (`http://localhost:8080/mcp`)
 
-## 3. WebSocket — document events (`/ws`)
-
-Connect to `ws://host/ws` (or `wss://`). Every message is a JSON text frame
-with an envelope `{"v":1,"type":"...", ...}`. Unknown `type` is ignored
-(forward compatible).
-
-### Client → server
-
-| type | fields | meaning |
+| Tool | Arguments | Behavior |
 |---|---|---|
-| `subscribe` | `doc_id` | start receiving events for a document |
-| `unsubscribe` | `doc_id` | stop receiving events |
-| `ping` | — | liveness check; server replies `pong` |
+| `get_script` | `doc_id` | Return working draft and current version. |
+| `get_element` | `doc_id`, `element_id` | Return manifest entries and nearby script lines. |
+| `edit_script` | `doc_id`, `base_version`, `script` | Save a full replacement draft; reject stale versions. |
+| `render` | `doc_id` | Commit the draft as a new version and render synchronously. Return version and manifest or a traceback. |
+| `editing_pdf` | `doc_id` | Send `updating_pdf` to subscribers. |
+| `add_svg` | `doc_id`, `name`, `svg` | Store an SVG at the project root; reference its name with `doc.svg(name, element_id)`. Return its storage key. |
+| `list_sources` | `doc_id` | List uploaded reference documents and their IDs. |
+| `get_source` | `doc_id`, `source_id` | Read the reference document as Markdown text. |
+| `list_versions` | `doc_id` | Return versions oldest first. |
+| `restore_version` | `doc_id`, `version` | Copy an older script into the draft. |
+| `list_elements` | `doc_id` | Return current head manifest. |
 
-### Server → client
+`render` commits before Python runs. A failed render can leave the new head version without a PDF or manifest. Project assets live at `tmp/pdf/{id}/{name}.{svg,png,jpg}`; successful renders snapshot them under `versions/{n}/assets/`. The active Go driver is `DriverFS`, rooted at repo `tmp/` by default.
 
-| type | fields | meaning |
+## Sources and image assets (Go REST)
+
+All routes below use the same optional REST bearer token and require an existing project. Generated storage keys remain under the project directory.
+
+| Method | Path | Behavior |
 |---|---|---|
-| `subscribed` | `doc_id`, `version` | subscription accepted; current head version |
-| `updating_pdf` | `doc_id` | a script change happened, render pending — show loading |
-| `pdf_updated` | `doc_id`, `version`, `actor`, `pdf_url`, `manifest_url` | render done — fetch these URLs |
-| `pdf_failed` | `doc_id`, `version`, `error` | render failed — keep the old PDF, show the error |
-| `error` | `code`, `message`, `doc_id?` | protocol or authorization error |
-| `pong` | — | reply to `ping` |
+| `POST` | `/docs/{id}/sources` | Multipart field `file`: PDF or UTF-8 Markdown. Return `201` with source metadata. PDF text is converted to `.md`. |
+| `GET` | `/docs/{id}/sources` | Return `{doc_id,sources:[...]}`. Use source IDs with `get_source`. |
+| `GET` | `/docs/{id}/sources/{sourceID}` | Return `text/markdown; charset=utf-8`. |
+| `POST` | `/docs/{id}/images` | Multipart field `file`: PNG/JPEG. Return `201 {name,key,url}`. |
+| `GET` | `/docs/{id}/images/{name}` | Return the stored PNG/JPEG. |
 
-Example flow when the assistant edits:
+Source uploads allow 20 MiB of input and at most 8 MiB of text. PDF conversion uses Poppler `pdftotext` with a 20-second timeout. No OCR is performed; PDFs without extractable text return `422`. Markdown structure and complex PDF layout are not reconstructed. Images allow up to 12 MiB and 20 million pixels through Go directly; chat applies smaller limits below. The model inserts uploaded images with `doc.image(name, element_id, width=None, height=None)`. Dimensions are points; setting one dimension preserves aspect ratio. With neither dimension the image fits within the default page frame.
 
-```json
-{"v":1,"type":"subscribed","doc_id":"1","version":2}
-{"v":1,"type":"updating_pdf","doc_id":"1"}
-{"v":1,"type":"pdf_updated","doc_id":"1","version":3,"actor":"system","pdf_url":"/docs/1/pdf?version=3","manifest_url":"/docs/1/manifest"}
-```
+Successful renders persist `cover_key` on each version and return `cover_url` in project metadata and version listing entries. Covers are 640 pixels on their longest edge. Template startup generates missing covers without replacing stored template scripts.
 
-### Client behavior
+## Document WebSocket (`ws://localhost:8080/ws`)
 
-1. Connect, `subscribe` to each open document.
-2. On `subscribed`: if `version` > displayed version, refetch immediately.
-3. On `updating_pdf`: show a loading state.
-4. On `pdf_updated`: fetch `GET /docs/{id}/manifest`, re-render viewer, set
-   displayed version. **Ignore if `version <= displayedVersion`** (dedupes).
-5. On `pdf_failed`: show the error, keep the current PDF.
-6. On reconnect: get a fresh connection, resubscribe, refetch any doc whose
-   `subscribed.version` is newer than displayed.
+Send `{"v":1,"type":"subscribe","doc_id":"PROJECT_ID"}`. `unsubscribe` accepts `doc_id`; `ping` receives `pong`.
 
----
+| Event | Fields | Client action |
+|---|---|---|
+| `subscribed` | `doc_id`, `version` | Refetch if newer than displayed version. |
+| `updating_pdf` | `doc_id` | Show loading. |
+| `pdf_updated` | `doc_id`, `version`, `actor`, `pdf_url`, `manifest_url`, `cover_url` | Fetch PDF and manifest. |
+| `pdf_failed` | `doc_id`, `version`, `error` | Show error; keep last usable PDF. |
+| `error` | `code`, `message`, optional `doc_id` | Handle protocol error. |
 
-## 4. Rust chat harness (`:3000`)
+Events are in-process hints. Resubscribe and refetch after reconnecting. The current server allows all subscriptions in development.
 
-### Health
+## Rust chat (`http://localhost:3000`)
 
-```bash
-curl localhost:3000/health    # -> {"ok":true}
-```
+`GET /health` returns `{"ok":true}`. `GET /tools` lists Go MCP tools. `POST /call` is a debug MCP proxy. `POST /chat` accepts `message`, optional `doc_id`, `system`, and `selections: [{element_id, page, bbox}]`. The legacy `selection: {element_id, page, bbox}` remains supported and is merged with the array. It returns one JSON object, `{"reply":"..."}`, or `502 {"error":"..."}`. `POST /chat/stream` accepts the same JSON and returns SSE events: `message` with `{delta}`, `tool_call` with `{id,name,arguments}`, `tool_result` with `{id,name,content}`, then `done` with `{reply}`. Failures after the stream begins use `error` with `{error}`. `GET /chat/history?doc_id=...` returns `{doc_id,messages}` oldest first when Postgres is available; it returns `400` without a document ID and `503` when persistence is unavailable. Chat has no per-user auth.
 
-### List MCP tools (for debugging)
+Both chat POST routes also accept `multipart/form-data`: text fields `message`, `doc_id`, optional `system`, JSON text fields `selection` and `selections`, and repeated file fields `images`. Images require a document ID. Limits are 20 MiB total, eight images, and 5 MiB per image. Rust uploads images to Go before starting the model loop or SSE response. Configure Rust `AUTH_TOKEN` to match Go when REST authentication is enabled. JSON requests continue to work. Selection context and uploaded `{name,key,url}` references are included in persisted user content.
 
-```bash
-curl localhost:3000/tools
-```
+## Project types and PowerPoint output
 
-```json
-[{"name":"get_script","description":"Return the current script text..."}, ...]
-```
+`POST /docs` accepts optional `type`, either `pdf` or `slideshow`. A selected template determines the type when omitted. Without a template, PDF defaults to `empty` and slideshow defaults to `slideshow-pptx`. An unknown type or a type/template mismatch returns `400`. Existing records without a type are read as `pdf`.
 
-### Chat (single turn)
+`GET /templates?type=slideshow` filters the gallery. Each template includes `type`; the new slideshow IDs are `slideshow-pptx`, `business-pptx`, and `metrics-pptx`. Existing `slideshow`, `business`, and `metrics` templates remain PDF templates for compatibility.
 
-```bash
-curl -X POST localhost:3000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"make the title blue","system":"You edit PDF scripts."}'
-```
+Project metadata includes `type`. Slideshow projects include `pptx_url` pointing to `GET /docs/{id}/pptx?version=N`, with the successful rendered version by default in the returned URL. The endpoint returns the PowerPoint MIME type and a download filename. Missing decks from rendered versions rebuild with their script and asset snapshot. Version records include `pptx_key` and slideshow download URLs. PDF projects have no PPTX output.
 
-```json
-{"reply":"I'll update the title style."}
-```
+MCP `get_script` includes `type`, so the model chooses `Doc` or `Slides`. `Slides` uses points from the top-left for input coordinates; its manifest uses the existing bottom-left PDF coordinates. Stable IDs cover text boxes, rectangles, and raster images. Native animations and transitions do not appear in the PDF preview.
 
-`selection` is optional on `/chat`. Send
-`{"element_id":"slide1-break","page":1,"bbox":[78,78,882,286]}` alongside
-`message` to target a selected PDF element. The bbox uses PDF points with a
-bottom-left origin.
-
-`system` is optional. The model is configured by env on the Rust server
-(`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`). LLM failure returns `502`:
-
-```json
-{"error":"..."}
-```
-
-### Call an MCP tool directly (for debugging)
-
-```bash
-curl -X POST localhost:3000/call \
-  -H 'Content-Type: application/json' \
-  -d '{"tool":"get_script","arguments":{"doc_id":"doc-1"}}'
-```
-
-```json
-{"ok":true,"content":"{\n  \"doc_id\": \"doc-1\",\n  ...\n}"}
-```
-
-`content` is a **JSON string** — parse it to read the tool result.
-
----
-
-## 5. Frontend flow (current)
-
-1. **Load** — open the seeded doc `1`, `GET /docs/1/manifest` for element
-   boxes, render the PDF.
-2. **Viewer** (Phase 2) — PDF.js pages, overlay boxes from the manifest.
-   Flip y and scale by zoom.
-3. **Select an element** — click a box, keep `{id, page, bbox, line}` in a
-   small store (Zustand).
-4. **Watch for changes** — hold a `/ws` subscription; show loading on
-   `updating_pdf`, refetch on `pdf_updated`.
-5. **Chat** (Phase 5) — post to `/chat`; the assistant edits over MCP, which
-   triggers the debounced render and the WS events above.
-
----
-
-## 6. Not yet implemented (frontend blockers)
-
-| Gap | Detail |
-|---|---|
-| **SSE streaming on chat** | `/chat` returns one JSON object. No token-delta / tool-event stream yet (Plan 12.2). |
-| **More selection context** | `/chat` accepts `selection: {element_id, page, bbox}`. Version, element text, and cropped image are not accepted yet (Plan 12.1, Phase 5). |
+`pdf_updated` events keep `type: "pdf_updated"` and include `project_type` (`pdf` or `slideshow`); slideshow updates also include the new version’s `pptx_url`.

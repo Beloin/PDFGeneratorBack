@@ -1,178 +1,95 @@
-# Frontend guide — wire to the seeded document `1`
+# Frontend integration guide
 
-> **Scope now:** use the seeded document `1` only. It is pre-rendered and
-> always present. Do **not** implement document creation or templates yet —
-> hardcode `doc_id = "1"` for now.
+Go serves project data and WebSocket events on `http://localhost:8080`. Rust serves chat on `http://localhost:3000`. This repository does not contain the frontend.
 
-## Servers
+## Template gallery and projects
 
-| Server | Addr | Use |
-|---|---|---|
-| Go main server | `http://localhost:8080` | REST + WebSocket |
-| Rust chat harness | `http://localhost:3000` | chat |
+1. Fetch `GET /templates` and display each `{id, name, cover_url}`.
+2. On template click, call `POST /docs` with `{"template":"report","title":"My report"}`. The title is optional. The response arrives after version 1 renders and contains `doc_id`, `pdf_url`, `cover_url`, and `manifest_url`. Open those URLs.
+3. Fetch `GET /docs` to show projects, newest update first. Use `GET /docs/{id}` to reopen one. `PATCH /docs/{id}` with `{"title":"New title"}` renames it; `DELETE /docs/{id}` removes it. Use the returned PDF and manifest URLs; after a failed edit, they point to `rendered_version` while `version` remains the script head.
 
----
+No demo projects are created at startup. Templates are independent from projects: editing a project never changes its source template. A failed initial render returns `500` and leaves no project to list.
 
-## 1. Load document `1`
+## Viewer and updates
 
-### Get the manifest (element boxes)
+Fetch the PDF and manifest URLs from project metadata. Manifest `bbox` uses `[x0, y0, x1, y1]` in PDF points from the bottom-left. Convert y with `page_height - y`, then scale by the viewer zoom. One element ID can appear on several pages.
 
-```bash
-curl http://localhost:8080/docs/1/manifest
+```js
+const ws = new WebSocket("ws://localhost:8080/ws");
+ws.onopen = () => ws.send(JSON.stringify({ v: 1, type: "subscribe", doc_id: project.doc_id }));
 ```
+
+Show loading on `updating_pdf`. On `pdf_updated`, fetch `pdf_url` and `manifest_url` and refresh the viewer; use `cover_url` to refresh the project thumbnail. On `pdf_failed`, show the error and keep the last usable PDF. Ignore versions already displayed. After reconnect, resubscribe and compare `subscribed.version` with the displayed version.
+
+## Chat selection
 
 ```json
 {
-  "doc_id": "1",
-  "page_size": [595.28, 841.89],
-  "elements": [
-    {"id":"title","type":"heading","page":1,"bbox":[78.0,741.89,517.28,763.89],"line":5},
-    {"id":"intro","type":"paragraph","page":1,"bbox":[78.0,705.89,517.28,741.89],"line":7},
-    {"id":"sales-table","type":"table","page":1,"bbox":[78.0,471.89,224.57,571.89],"line":16}
+  "doc_id": "PROJECT_ID",
+  "message": "Make the title blue",
+  "selections": [
+    {"element_id":"title","page":1,"bbox":[78,741.89,517.28,763.89]},
+    {"element_id":"subtitle","page":1,"bbox":[78,700,517,730]}
   ]
 }
 ```
 
-### Get the PDF
+Send this to Rust `POST /chat/stream` with `fetch` and read the `text/event-stream` response. `EventSource` cannot send the POST body. `selections` is optional context for the model. The older single `selection` object remains supported; set `doc_id` for editing and chat history.
 
-```bash
-curl -o doc.pdf http://localhost:8080/docs/1/pdf
-```
+| SSE event | JSON data | Frontend action |
+|---|---|---|
+| `message` | `{"delta":"..."}` | Append the text to the assistant message. |
+| `tool_call` | `{"id":"...","name":"...","arguments":{...}}` | Show which tool the model called. |
+| `tool_result` | `{"id":"...","name":"...","content":"..."}` | Mark the tool complete; show the result if useful. |
+| `done` | `{"reply":"..."}` | Finish the assistant message. |
+| `error` | `{"error":"..."}` | Show the error and stop loading. |
 
-`Content-Type: application/pdf`. Feed the bytes into PDF.js. `?version=N` gets
-an older version (not needed now).
+Tool events can repeat before the final message. Rendering events may arrive over Go's WebSocket before `done`. `POST /chat` still returns one JSON object for older clients. `GET /chat/history?doc_id=...` returns saved messages if Rust can reach Postgres.
 
-`bbox` is `[x0, y0, x1, y1]` in PDF points, origin **bottom-left**. To place an
-overlay: `y_css = page_height - y_pdf`, then scale by zoom.
+## Reference sources
 
----
-
-## 2. Watch for changes (WebSocket)
-
-Connect `ws://localhost:8080/ws` and subscribe:
+Upload a PDF or UTF-8 Markdown file to Go before asking the model to use it:
 
 ```js
-const ws = new WebSocket("ws://localhost:8080/ws");
-ws.onopen = () => ws.send(JSON.stringify({ v: 1, type: "subscribe", doc_id: "1" }));
+const source = new FormData();
+source.append("file", sourceFile);
+const response = await fetch(`/docs/${docId}/sources`, { method: "POST", body: source });
+if (!response.ok) throw new Error(await response.text());
 ```
 
-Server → client events for `1`:
+Use `GET /docs/{id}/sources` to list sources and `GET /docs/{id}/sources/{sourceID}` to read one. PDF uploads are converted to Markdown text. Scanned PDFs without extractable text are rejected; there is no OCR. Sources belong to the project, and the AI can read them using `list_sources` and `get_source`.
 
-| type | fields | what the FE does |
-|---|---|---|
-| `subscribed` | `doc_id`, `version` | if `version` > displayed, refetch now |
-| `updating_pdf` | `doc_id` | show a loading/spinner |
-| `pdf_updated` | `doc_id`, `version`, `pdf_url`, `manifest_url` | fetch `pdf_url` + `manifest_url`, re-render, update displayed version |
-| `pdf_failed` | `doc_id`, `version`, `error` | show the error, keep the current PDF |
+## Images attached to chat
 
-Example `pdf_updated`:
-
-```json
-{"v":1,"type":"pdf_updated","doc_id":"1","version":3,"actor":"system",
- "pdf_url":"/docs/1/pdf?version=3","manifest_url":"/docs/1/manifest"}
-```
-
-Dedupe: ignore `pdf_updated` where `version <= displayedVersion`.
-
-On reconnect: resubscribe to `1`, then refetch if `subscribed.version` is newer.
-
----
-
-## 3. Chat (edit document `1`)
-
-Endpoint: `POST http://localhost:3000/chat`.
-
-### Request
-
-```json
-{
-  "doc_id": "1",
-  "message": "hello",
-  "selection": {"element_id": "slide1-break", "page": 1, "bbox": [78, 78, 882, 286]}
-}
-```
-
-| Field | Required | Notes |
-|---|---|---|
-| `message` | yes | the user's instruction |
-| `doc_id` | no | the document to edit; use `"1"` |
-| `system` | no | extra system instructions; usually leave unset |
-| `selection` | no | selected `{element_id, page, bbox}`; bbox uses PDF points, origin bottom-left |
-
-The assistant receives the selection with the message and can inspect its
-`element_id` through MCP. It edits the script over MCP and renders automatically.
-You do not call any render endpoint.
-
-### Response
-
-One JSON object, **not streamed**:
-
-```json
-{ "reply": "Changed the title color to blue." }
-```
-
-`reply` is the assistant's plain-text summary.
-
-### Errors
-
-```json
-{ "error": "..." }
-```
-
-`502 Bad Gateway` — the LLM or MCP call failed, or the loop hit its step cap.
-Show `error`.
-
-### Timing
-
-The request can take several seconds (the harness runs a loop: model call →
-tool call → result → model call …). Set a long client timeout (e.g. 60 s) and
-show a "thinking" state.
-
-While it runs, the document changes arrive on the **WebSocket**, not in the
-chat response. The two are independent:
-
-1. You `POST /chat`.
-2. The Go server pushes `updating_pdf` → `pdf_updated` over `/ws`.
-3. You refetch the PDF + manifest on `pdf_updated`.
-4. The `POST /chat` response returns later with the `reply`.
-
-Do not wait for the chat response to refresh the document — refresh on the
-WebSocket events.
-
-### fetch example
+Both Rust chat endpoints also accept multipart form data:
 
 ```js
-async function ask(message, selection = null) {
-  const res = await fetch("http://localhost:3000/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ doc_id: "1", message, selection }),
-  });
-  if (!res.ok) {
-    const { error } = await res.json();
-    throw new Error(error ?? `HTTP ${res.status}`);
-  }
-  return (await res.json()).reply;
-}
+const form = new FormData();
+form.append("doc_id", docId);
+form.append("message", "Add these images to the selected slide");
+form.append("selections", JSON.stringify(selectedElements));
+for (const file of imageFiles) form.append("images", file);
+const response = await fetch("/chat/stream", { method: "POST", body: form });
+if (!response.ok) throw new Error(await response.text());
+// Read SSE events from response.body as with JSON chat.
 ```
 
----
+Do not set `Content-Type` manually; the browser supplies the multipart boundary. Images require `doc_id`. PNG and JPEG files are stored with generated names and passed to the model as asset references. The model adds them to the generating script; uploading alone does not change the PDF. Direct asset upload is also available at Go `POST /docs/{id}/images` using field `file`, returning `{name,key,url}`. Persisted chat includes the image references.
 
-## 4. The full flow, in order
+## Chat history
 
-1. `GET /docs/1/manifest` + `GET /docs/1/pdf` → render the viewer.
-2. Open `/ws`, `subscribe` to `"1"`.
-3. User sends a message: `POST /chat {doc_id:"1", message, selection}`.
-4. Server pushes `updating_pdf` (spinner) → `pdf_updated` (fetch `pdf_url` +
-   `manifest_url`).
-5. Re-render PDF.js + overlays, update displayed version.
-6. The chat `reply` arrives; show it in the chat panel.
+Fetch `GET /chat/history?doc_id=...` when opening a document. The response is `{doc_id,messages}`, ordered oldest first. Messages include `role`, `content`, and optional `tool_calls`/`tool_call_id`. Render user and assistant entries; tool entries can populate the activity view. A missing document ID returns `400`; unavailable persistence returns `503`. Start Postgres to retain conversations across restarts.
 
----
+The backend has no CORS configuration. A browser on another origin needs a same-origin proxy or a backend CORS change. The current auth model is for local development only.
 
-## 5. Deliberately skipped for now
+## Choosing a project type
 
-- **Document creation / templates** — use `"1"`.
-- **Undo UI** — `POST /docs/1/restore {"version":N}` works but is optional.
-- **Streaming (SSE)** — the chat reply is one object; no token deltas or
-  tool-call events yet.
+Offer `pdf` and `slideshow` when creating a project. Fetch `GET /templates?type=pdf` or `?type=slideshow` for the matching gallery. Each template includes its type. Send both the selected type and template to `POST /docs`, for example:
+
+```json
+{"type":"slideshow","template":"business-pptx","title":"Business plan"}
+```
+
+Continue using `pdf_url`, `manifest_url`, and `cover_url` for the viewer and selection UI. Slideshow metadata also contains `pptx_url`; offer it as an editable PowerPoint download. Version listing entries expose the corresponding historical download URL. Slideshow `pdf_updated` events also carry `project_type` and `pptx_url`; refresh the download link alongside the preview. The chat request shape is unchanged.
+
+Omitting a type infers it from the template. Existing projects and old template IDs remain PDF projects. For native PowerPoint slides, use `slideshow-pptx`, `business-pptx`, or `metrics-pptx`. A mismatched type/template returns `400`.

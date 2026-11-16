@@ -1,30 +1,42 @@
 # Run the sample document and publish its manifest as the target output.
 target(
     name = "gen",
+    cache = False,
     driver = "bash",
     deps = [
+        file(".env"),
         file("run.py"),
         file("doc.py"),
         file("examples/sample.py"),
     ],
-    # pyenv's python3 is a `#!/usr/bin/env bash` shim, so bash must be on PATH.
     tools = ["//@heph/bin:python3", "//@heph/bin:bash"],
-    run = "python3 run.py examples/sample.py out.pdf && cp out.pdf.manifest.json $OUT",
+    pass_env = ["PDF_PYTHON", "PYENV_ROOT", "PYENV_VERSION"],
+    run = '''
+set -a
+source ./.env
+set +a
+"${PDF_PYTHON:?Set PDF_PYTHON in .env}" run.py examples/sample.py out.pdf
+cp out.pdf.manifest.json "$OUT"
+''',
     out = "manifest.json",
 )
 
-# Forced venv setup (side effect): creates the host venv with the renderer's
-# Python deps (reportlab, svglib). The venv lives OUTSIDE the workspace because
-# the sandbox can read host paths (like /usr/bin/python3) but not the workspace's
-# own .venv. Run once: `heph run //gen:venv`.
+# Creates the renderer venv at the host path configured in .env.
 target(
     name = "venv",
     driver = "bash",
     cache = False,
-    deps = {"req": file("requirements.txt")},
+    deps = {
+        "req": file("requirements.txt"),
+        "envfile": file(".env"),
+    },
+    pass_env = ["PYTHON_BOOTSTRAP", "PYTHON_VENV"],
     run = '''
-/usr/bin/python3 -m venv /home/beloin/.cache/pdf-editor-back/venv
-/home/beloin/.cache/pdf-editor-back/venv/bin/python3 -m pip install --disable-pip-version-check -r "$SRC_REQ"
+set -a
+source "$SRC_ENVFILE"
+set +a
+"${PYTHON_BOOTSTRAP:?Set PYTHON_BOOTSTRAP in .env}" -m venv "${PYTHON_VENV:?Set PYTHON_VENV in .env}"
+"$PYTHON_VENV/bin/python3" -m pip install --disable-pip-version-check -r "$SRC_REQ"
 echo ready > "$OUT"
 ''',
     out = "venv.ready",

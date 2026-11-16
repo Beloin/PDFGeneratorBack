@@ -1,48 +1,32 @@
 @startuml
-title Chat-Edited PDF Generator — current component architecture
+title Chat-edited PDF backend
 skinparam componentStyle rectangle
-skinparam defaultFontName Helvetica
 
-cloud "Ollama\n:11434" as ollama
-artifact "PDF output\nout.pdf + manifest.json" as pdf
+actor Browser
+component "Go server\nREST / MCP / WebSocket" as Go
+component "Rust chat\nmodel and tool loop" as Rust
+component "Python Doc runner\nstaged SVG assets" as Python
+interface "Storage Driver" as Driver
+database "DriverFS\nrepo tmp/" as FS
+database "Postgres\noptional chat history" as DB
+cloud "LLM endpoint" as LLM
 
-package "web/ (React)" {
-    component "Viewer + chat panel" as web <<planned>>
-}
+Browser --> Go : REST + WebSocket
+Browser --> Rust : JSON chat
+Rust --> Go : MCP Streamable HTTP
+Rust --> LLM : chat completions
+Rust --> DB : chat messages
+Go --> Driver : project/template keys
+Driver --> FS
+Go --> Python : subprocess render
 
-package "chat/ (Rust axum :3000)" {
-    component "routes\n/health /tools /call /chat" as routes
-    component "LLM client\nOpenAI-compatible" as llm
-    component "MCP client\n(rmcp)" as mcpclient
-}
-
-package "server/ (Go :8080)" {
-    component "MCP server\n/mcp streamable HTTP" as mcpsrv
-    component "REST API\n/docs" as rest
-    component "Store\n(in-memory)" as store
-    component "Runner\nsubprocess" as runner
-}
-
-package "gen/ (Python)" {
-    component "run.py\nrunner" as runpy
-    component "doc.py\nDoc wrapper" as docpy
-}
-
-web ..> routes : "REST + SSE (planned)"
-routes --> llm : "complete()"
-routes --> mcpclient : "list/call tools"
-llm --> ollama : "POST /v1/chat/completions"
-mcpclient --> mcpsrv : "MCP streamable HTTP"
-rest --> store
-mcpsrv --> store
-mcpsrv --> runner
-rest --> runner
-runner --> runpy : "python3 run.py"
-runpy --> docpy : "imports"
-runpy ..> pdf : "writes"
-
-note bottom of mcpsrv
-  7 tools: get_script, get_element, edit_script,
-  run_script, list_versions, restore_version, list_elements
+note bottom of FS
+  templates/{id}/template.json
+  pdf/{id}/project.json
+  pdf/{id}/{asset}.svg
+  pdf/{id}/versions/{n}/script.py
+  pdf/{id}/versions/{n}/manifest.json
+  pdf/{id}/versions/{n}/pdf_render.pdf
+  pdf/{id}/versions/{n}/assets/{asset}.svg
 end note
 @enduml

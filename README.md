@@ -1,69 +1,94 @@
-# Chat-Edited PDF Generator — backend
+# Chat-edited PDF backend
 
-Monorepo for the backend of the chat-edited PDF generator. See `docs/PLAN.md`
-for the full plan.
-
-## Services
-
-| Directory | Language | Role |
-|---|---|---|
-| `server/` | Go | Main server: source of truth for documents, script versions, and rendered outputs. Exposes the tools as MCP (streamable HTTP at `/mcp`) and the same operations as REST (`/docs`). |
-| `chat/` | Rust | Chat harness: connects to the Go MCP server as an MCP client (rmcp) and exposes the tools over HTTP. The LLM loop is Phase 4. |
-| `gen/` | Python | Runner + `Doc` wrapper. Runs an AI-written script and writes `out.pdf` + `out.pdf.manifest.json`. |
-
-`web/` (the React frontend) is out of scope for this backend repo.
-
-## Tools (MCP + REST)
-
-`get_script`, `get_element`, `edit_script`, `run_script`, `list_versions`,
-`restore_version`, `list_elements`.
+Go owns projects, templates, PDFs, manifests, MCP tools, and WebSocket events. Rust runs the chat model/tool loop. Python renders scripts through the `Doc` wrapper. See [architecture](docs/architecture.md), [API](docs/backend-api.md), and [frontend guide](docs/frontend-guide.md).
 
 ## Run locally
 
-```bash
-# Go server (:8080)
-(cd server && go run ./cmd/server -gen ../gen/run.py)
+Install LibreOffice Impress (the `libreoffice` executable) for slideshows. `heph run //server:run` first prepares its renderer dependencies, including `python-pptx==1.0.2`, in the interpreter configured by `server/.env` (`PDF_PYTHON`).
 
-# Rust chat harness (:3000)
-(cd chat && cargo run)          # MCP_SERVER_URL defaults to http://localhost:8080/mcp
+Install Poppler utilities (`pdftoppm` and `pdftotext`; Debian/Ubuntu package `poppler-utils`) on the server host. Covers use the first PDF page; PDF source ingestion extracts text without OCR.
+
+Each project owns its configuration: copy `server/.env.example`, `chat/.env.example`, and `gen/.env.example` to `.env` in the same directory. Set the server data and Python paths, generator venv path, and chat model and API key. Existing local values and credentials have been preserved in those project files.
+
+```bash
+heph run //gen:venv
+heph run //server:run  # separate terminal
+heph run //chat:run    # separate terminal
 ```
 
-The Rust server loads `chat/.env` for its LLM settings. To use the Claude profile,
-run `(cd chat && CHAT_ENV_FILE=.env.claude cargo run)`. Both files are ignored by
-Git; shell environment variables take precedence. Unscoped Claude keys also
-need `ANTHROPIC_WORKSPACE_ID` in `chat/.env.claude`.
+Go listens on `:8080`; Rust listens on `:3000`. Go persists projects under this repo's ignored `tmp/` through `DriverFS`. Rust optionally persists chat history in Postgres. To enable chat history, run `docker compose up -d db`. Go does not need Postgres.
 
-With heph, run `heph r //chat:run` for `chat/.env`, or
-`CHAT_ENV_FILE=.env.claude heph r //chat:run` for the Claude profile. The Rust
-process reads these files from the workspace; they are not copied into the
-heph sandbox.
+The Go data root defaults to repo `tmp/`. Override it with `PDF_DATA_DIR` or `-data-dir`. Each project has one `tmp/pdf/{id}/` directory containing its draft, versioned scripts, manifests, PDFs, cover images, uploaded images, SVGs, and source Markdown. Template definitions are seeded once under `tmp/templates/`; a restart never overwrites them. Clearing `tmp/` deletes projects and templates.
 
-REST (Go server):
+Each BUILD run command sources its own project’s `.env` with automatic export before starting the service. `pass_env` lists host variables allowed into the target; assignments in `.env` override those values. Go and Rust read process variables only. To select Claude, change the `envfile` dependency in `chat/BUILD` from `.env` to `.env.claude`. Chat profiles remain inside `chat/`. Real env profiles are Git ignored; each project’s `.env.example` contains no keys.
+
+`PDF_LISTEN_ADDR`, `PDF_DATA_DIR`, `PDF_GEN_PATH`, `PDF_PYTHON`, and `AUTH_TOKEN` configure Go. An empty `PDF_GEN_PATH` lets BUILD use the staged renderer path. `PYTHON_BOOTSTRAP` and `PYTHON_VENV` configure venv creation. `CHAT_LISTEN_ADDR`, `MCP_SERVER_URL`, `DATABASE_URL`, and `RUST_LOG` configure Rust. `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, optional `LLM_REASONING_EFFORT`, and optional `ANTHROPIC_WORKSPACE_ID` configure the OpenAI-compatible client. The client does not implement Anthropic's native Messages API.
+
+For direct runs, export that project’s file in its shell first:
 
 ```bash
-curl -s localhost:8080/health
-curl -s localhost:3000/health          # Rust harness
-curl -s localhost:3000/tools           # list MCP tools (Rust -> Go)
+# Server terminal:
+cd server
+set -a
+source .env
+set +a
+export PDF_GEN_PATH="${PDF_GEN_PATH:-../gen/run.py}"
+go run ./cmd/server
+
+# Chat terminal, starting from the repository root:
+cd chat
+set -a
+source .env
+set +a
+cargo run
 ```
 
-## Build with heph
+## Start a project
 
 ```bash
-heph run //gen:gen                    # run the sample PDF, cat the manifest
+curl http://localhost:8080/templates
+curl -s -X POST http://localhost:8080/docs \
+  -H 'Content-Type: application/json' \
+  -d '{"template":"report","title":"My report"}'
+curl http://localhost:8080/docs
+```
+
+`POST /docs` renders version 1 before returning. Its response includes `doc_id`, `pdf_url`, `cover_url`, and `manifest_url`. The frontend opens those URLs, subscribes to `/ws`, and sends edits to Rust `POST /chat/stream`. The model saves a draft with `edit_script` and commits it with `render`.
+
+The gallery includes `business` (business strategy slides) and `metrics` (an illustrative metrics review), alongside `empty`, `report`, and `slideshow`.
+
+## PDF and slideshow projects
+
+`POST /docs` accepts `type: "pdf"` or `type: "slideshow"`. PDF projects use ReportLab. Slideshow projects use python-pptx, then LibreOffice creates the PDF preview. Both share the viewer, selection manifest, cover, assets, and version history. Slideshow metadata includes `pptx_url` for editable PowerPoint downloads.
+
+For example: `{"type":"slideshow","template":"business-pptx","title":"Business plan"}`. New slideshow template IDs are `slideshow-pptx`, `business-pptx`, and `metrics-pptx`. The older template IDs and projects retain their PDF scripts. Omitting the type infers it from the template; omitting both creates a blank PDF.
+
+## Source documents and chat attachments
+
+Upload reference PDF or Markdown files to `POST /docs/{id}/sources` as multipart field `file`. PDFs become Markdown text for the model’s `list_sources` and `get_source` tools. Text extraction does not preserve arbitrary PDF layouts; scanned PDFs need OCR before upload.
+
+Chat accepts JSON or multipart fields `message`, `doc_id`, optional `system`, `selection`/`selections` JSON, and repeated `images` files. Uploaded PNG/JPEG files become document assets that the model can insert with `doc.image(name, element_id, width=None, height=None)`. Dimensions are PDF points; one dimension preserves aspect ratio. See the [frontend guide](docs/frontend-guide.md) for requests and history.
+
+## Heph
+
+```bash
+heph run //gen:venv                   # prepare host renderer venv
+heph run //gen:gen                    # sample manifest
 heph run //server/cmd/server:build    # Go binary
 heph run //chat:chat                  # Rust binary
-heph run //:backend                   # all three
+heph run //:backend                   # build all targets
+heph run //server:run                 # Go server, blocking
+heph run //chat:run                   # Rust chat, blocking
 ```
 
-`//server:run` keeps PDFs in `tmp/pdfs/` and assets in `tmp/assets/` at the repo
-root. Both are Git ignored. Use `-out` and `-assets` when running the Go binary
-directly to choose other locations.
+Runtime and renderer targets source their project’s `.env` from their BUILD dependency and run uncached. Binary build targets do not depend on `.env`. `PDF_DATA_DIR` and `PYTHON_VENV` should be absolute host paths so data and the venv persist outside Heph's copied inputs. Server and generator Python paths are configured independently; point them to the same venv when sharing one. No checkout or home paths are hardcoded in BUILD. Use separate terminals for the two blocking server targets.
 
-## Phase status
+## Current limits
 
-Phase 0 done. Phase 1 (`Doc` wrapper + manifest) done: multi-page split keeps
-the same id. Phase 3 core done: documents, versioned edits with stale-reject,
-subprocess `run_script` (timeout + scrubbed env), REST + MCP tools, in-memory
-store. Phase 4 partially: MCP client wiring works (`/tools`, `/call`); the model
-loop and auth forwarding are still to come. Phase 6 (sandbox, OAuth, quotas) not
-started.
+The Python runner has a timeout and reduced environment but no public-use sandbox. REST has only an optional shared `AUTH_TOKEN`; MCP, chat, and WebSocket have no per-user auth. The filesystem store coordinates writes within one Go process; do not run multiple Go replicas against the same data root.
+
+## Slideshow verification
+
+With `PDF_PYTHON` exported from the server configuration and LibreOffice installed, run `go test -v ./internal/service -run TestRealSlideshowProjectLifecycle` from `server/`. This verifies a real slideshow project, PPTX download, PDF preview, cover, manifest, and rebuilding a missing historical deck. Environments that prohibit Unix socket binding cannot start LibreOffice; this integration test reports an explicit skip there. Python tests separately verify real PPTX generation and exercise conversion orchestration with a test converter.
+
+`//server:run` depends on the uncached `//server:renderer` setup target. Setup installs `gen/requirements.txt` using the server’s own `PDF_PYTHON` and checks imports before Go starts. This is independent of `//gen:venv`, which uses `gen/.env`. The configured server interpreter must already exist; point it at a virtual environment.

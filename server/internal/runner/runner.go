@@ -18,9 +18,10 @@ import (
 
 // Runner runs scripts through the gen/run.py wrapper.
 type Runner struct {
-	PyPath  string // path to gen/run.py
-	Python  string // python3 binary, default "python3"
-	Timeout time.Duration
+	PyPath   string // path to gen/run.py
+	Python   string // python3 binary, default "python3"
+	PDFToPPM string // first-page PNG renderer, default "pdftoppm"
+	Timeout  time.Duration
 }
 
 // New returns a Runner.
@@ -28,7 +29,7 @@ func New(pyPath, python string) *Runner {
 	if python == "" {
 		python = "python3"
 	}
-	return &Runner{PyPath: pyPath, Python: python, Timeout: 30 * time.Second}
+	return &Runner{PyPath: pyPath, Python: python, PDFToPPM: "pdftoppm", Timeout: 30 * time.Second}
 }
 
 // Result is the outcome of one run.
@@ -36,18 +37,42 @@ type Result struct {
 	OK        bool   `json:"ok"`
 	Manifest  string `json:"manifest,omitempty"`
 	PDF       []byte `json:"-"` // rendered PDF bytes; not serialized to JSON
+	PPTX      []byte `json:"-"` // editable slideshow deck; not serialized to JSON
+	CoverPNG  []byte `json:"-"` // first page rendered as PNG
 	Traceback string `json:"traceback,omitempty"`
 }
 
 // Run executes script and returns the rendered PDF + manifest or a traceback.
-// assetRoot is the URI of the document's asset directory (file:// or s3://);
-// it is exposed to the script as PDF_ASSET_ROOT so it can load assets.
-func (r *Runner) Run(script, assetRoot string) (Result, error) {
+// Assets are materialized in the temporary working directory for any driver.
+func (r *Runner) Run(script string, assets map[string][]byte) (Result, error) {
+	return r.RunType(script, assets, "pdf")
+}
+
+// RunType executes a document script for the requested project type.
+func (r *Runner) RunType(script string, assets map[string][]byte, projectType string) (Result, error) {
+	if projectType == "" {
+		projectType = "pdf"
+	}
+	if projectType != "pdf" && projectType != "slideshow" {
+		return Result{}, fmt.Errorf("unsupported project type %q", projectType)
+	}
 	dir, err := os.MkdirTemp("", "pdfgen-")
 	if err != nil {
 		return Result{}, fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(dir)
+	assetDir := filepath.Join(dir, "assets")
+	if err := os.Mkdir(assetDir, 0o755); err != nil {
+		return Result{}, err
+	}
+	for name, data := range assets {
+		if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
+			return Result{}, fmt.Errorf("invalid asset name %q", name)
+		}
+		if err := os.WriteFile(filepath.Join(assetDir, name), data, 0o644); err != nil {
+			return Result{}, err
+		}
+	}
 
 	scriptPath := filepath.Join(dir, "script.py")
 	outPath := filepath.Join(dir, "out.pdf")
@@ -62,9 +87,9 @@ func (r *Runner) Run(script, assetRoot string) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve runner path: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, r.Python, pyPath, scriptPath, outPath)
+	cmd := exec.CommandContext(ctx, r.Python, pyPath, scriptPath, outPath, "--type", projectType)
 	cmd.Dir = dir
-	cmd.Env = scrubbedEnv(dir, assetRoot)
+	cmd.Env = scrubbedEnv(dir, "file://"+assetDir)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -76,12 +101,36 @@ func (r *Runner) Run(script, assetRoot string) (Result, error) {
 		res.Manifest = string(b)
 	}
 	if runErr == nil {
+		var pptx []byte
+		if projectType == "slideshow" {
+			pptx, err = os.ReadFile(outPath + ".pptx")
+			if err != nil {
+				return Result{}, fmt.Errorf("read rendered PPTX: %w", err)
+			}
+		}
 		pdf, err := os.ReadFile(outPath)
 		if err != nil {
 			return Result{}, fmt.Errorf("read rendered pdf: %w", err)
 		}
+		coverPrefix := filepath.Join(dir, "cover")
+		pdfToPPM := r.PDFToPPM
+		if pdfToPPM == "" {
+			pdfToPPM = "pdftoppm"
+		}
+		coverCmd := exec.CommandContext(ctx, pdfToPPM, "-f", "1", "-l", "1", "-singlefile", "-png", "-scale-to", "640", outPath, coverPrefix)
+		var coverErr bytes.Buffer
+		coverCmd.Stderr = &coverErr
+		if err := coverCmd.Run(); err != nil {
+			return Result{}, fmt.Errorf("render PDF cover: %s: %w", coverErr.String(), err)
+		}
+		coverPNG, err := os.ReadFile(coverPrefix + ".png")
+		if err != nil {
+			return Result{}, fmt.Errorf("read rendered PDF cover: %w", err)
+		}
 		res.OK = true
 		res.PDF = pdf
+		res.PPTX = pptx
+		res.CoverPNG = coverPNG
 		return res, nil
 	}
 

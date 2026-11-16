@@ -6,6 +6,7 @@ package ws
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -45,6 +46,7 @@ func PDFUpdated(docID string, version int, pdfURL, manifestURL string) Event {
 	e["doc_id"] = docID
 	e["version"] = version
 	e["actor"] = "system"
+	e["cover_url"] = fmt.Sprintf("/docs/%s/cover?version=%d", docID, version)
 	if pdfURL != "" {
 		e["pdf_url"] = pdfURL
 	}

@@ -13,6 +13,7 @@ Rules for AI-written scripts (enforced here):
 
 import inspect
 import json
+import math
 import os
 
 from reportlab.lib.pagesizes import A4
@@ -21,6 +22,7 @@ from reportlab.platypus import (
     BaseDocTemplate,
     Flowable,
     Frame,
+    Image,
     PageBreak,
     PageTemplate,
     Paragraph,
@@ -167,12 +169,35 @@ class Doc:
     def svg(self, name, element_id):
         self._add(_SvgFlowable(_svg_to_drawing(_asset_path(name))), element_id, "svg")
 
+    def image(self, name, element_id, width=None, height=None):
+        """Embed an uploaded image; dimensions are PDF points.
+
+        A single dimension preserves aspect ratio. With neither dimension,
+        fit the image within the default page frame without enlarging it.
+        """
+        for value in (width, height):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError("image dimensions must be positive finite numbers")
+        image = Image(_asset_path(name))
+        natural_width, natural_height = image.imageWidth, image.imageHeight
+        if width is None and height is None:
+            scale = min(1, (self.pagesize[0] - 156) / natural_width,
+                        (self.pagesize[1] - 156) / natural_height)
+            width, height = natural_width * scale, natural_height * scale
+        elif width is None:
+            width = height * natural_width / natural_height
+        elif height is None:
+            height = width * natural_height / natural_width
+        image.drawWidth, image.drawHeight = width, height
+        self._add(image, element_id, "image")
+
     def save(self):
         doc = BaseDocTemplate(self.path, pagesize=self.pagesize)
         frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
         pt_kwargs = {"onPage": self.on_page} if self.on_page is not None else {}
         doc.addPageTemplates([PageTemplate(id="main", frames=[frame], **pt_kwargs)])
-        doc.build(self.story)
+        # A blank document still needs one page for viewing and cover rendering.
+        doc.build(self.story or [Spacer(1, 1)])
         with open(self.path + ".manifest.json", "w", encoding="utf-8") as f:
             json.dump(
                 {"page_size": list(self.pagesize), "elements": self.registry},
