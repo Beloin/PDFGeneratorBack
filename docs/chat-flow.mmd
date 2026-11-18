@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant FE as Frontend
+    participant Chat as Rust chat
+    participant LLM
+    participant Go as Go editor
+    FE->>Go: Subscribe to /ws
+    FE->>Chat: POST /chat/stream
+    Chat->>Go: MCP tools/list
+    loop Until the LLM returns a final answer
+        Chat->>LLM: Messages and tools
+        LLM-->>Chat: Text deltas or tool calls
+        Chat-->>FE: SSE message / tool_call
+        Chat->>Go: MCP tools/call (when requested)
+        Go-->>FE: WebSocket render events (when rendering)
+        Go-->>Chat: Tool result
+        Chat-->>FE: SSE tool_result
+    end
+    Chat-->>FE: SSE done (or error)
