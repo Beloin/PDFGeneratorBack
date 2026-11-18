@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -44,22 +45,20 @@ func writeDocumentError(w http.ResponseWriter, err error) {
 func projectResponse(d store.Document) map[string]any {
 	v := d.Current().Version
 	rendered := v
-	for i := len(d.Versions) - 1; i >= 0; i-- {
-		if d.Versions[i].Manifest != "" && d.Versions[i].PDFKey != "" {
-			rendered = d.Versions[i].Version
-			break
-		}
+	if version, ok := d.RenderedVersion(); ok {
+		rendered = version.Version
 	}
 	response := map[string]any{
 		"doc_id": d.ID, "title": d.Title, "template": d.Template,
 		"type":    store.NormalizeType(d.Type),
 		"version": v, "rendered_version": rendered, "created_at": d.CreatedAt, "updated_at": d.UpdatedAt,
-		"pdf_url":      fmt.Sprintf("/docs/%s/pdf?version=%d", d.ID, rendered),
 		"cover_url":    fmt.Sprintf("/docs/%s/cover?version=%d", d.ID, rendered),
 		"manifest_url": fmt.Sprintf("/docs/%s/manifest?version=%d", d.ID, rendered),
+		"pdf_url":      fmt.Sprintf("/docs/%s/pdf?version=%d", d.ID, rendered),
 	}
 	if store.NormalizeType(d.Type) == store.TypeSlideshow {
 		response["pptx_url"] = fmt.Sprintf("/docs/%s/pptx?version=%d", d.ID, rendered)
+		response["slides_url"] = fmt.Sprintf("/docs/%s/slides?version=%d", d.ID, rendered)
 	}
 	return response
 }
@@ -286,6 +285,130 @@ func (s *Service) handleGetPDF(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(pdf)
 }
 
+func (s *Service) handleGetSlides(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	doc, err := s.store.Get(id)
+	if err != nil {
+		writeDocumentError(w, err)
+		return
+	}
+	if store.NormalizeType(doc.Type) != store.TypeSlideshow {
+		writeError(w, http.StatusNotFound, fmt.Errorf("project %q is not a slideshow", id))
+		return
+	}
+	version := doc.Current().Version
+	if v := r.URL.Query().Get("version"); v != "" {
+		if n, parseErr := strconv.Atoi(v); parseErr == nil {
+			version = n
+		}
+	}
+	sv, ok := s.docVersion(doc, version)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("no slides for version %d", version))
+		return
+	}
+	var slidesJSON []byte
+	if sv.SlidesKey != "" {
+		slidesJSON, err = s.driver.Get(r.Context(), sv.SlidesKey)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if slidesJSON == nil {
+		if sv.Manifest == "" {
+			writeError(w, http.StatusNotFound, fmt.Errorf("no slides for version %d", version))
+			return
+		}
+		res := s.run(id, version, true)
+		var rebuilt struct {
+			OK        bool   `json:"ok"`
+			Traceback string `json:"traceback"`
+		}
+		result := resultText(res)
+		if json.Unmarshal([]byte(result), &rebuilt) != nil || !rebuilt.OK {
+			if rebuilt.Traceback != "" {
+				result = rebuilt.Traceback
+			}
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("rebuild slides for version %d failed: %s", version, result))
+			return
+		}
+		doc, err = s.store.Get(id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		sv, ok = s.docVersion(doc, version)
+		if !ok || sv.SlidesKey == "" {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("rebuilt slides for version %d have no key", version))
+			return
+		}
+		slidesJSON, err = s.driver.Get(r.Context(), sv.SlidesKey)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("read rebuilt slides for version %d: %w", version, err))
+			return
+		}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(slidesJSON, &payload); err != nil || payload == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("invalid slides JSON for version %d", version))
+		return
+	}
+	if slides, ok := payload["slides"].([]any); ok {
+		for _, rawSlide := range slides {
+			slide, ok := rawSlide.(map[string]any)
+			if !ok {
+				continue
+			}
+			elements, ok := slide["elements"].([]any)
+			if !ok {
+				continue
+			}
+			for _, rawElement := range elements {
+				element, ok := rawElement.(map[string]any)
+				if !ok || element["type"] != "image" {
+					continue
+				}
+				name, ok := element["asset_name"].(string)
+				if !ok || name == "" {
+					continue
+				}
+				element["image_url"] = fmt.Sprintf("/docs/%s/images/%s?version=%d", url.PathEscape(id), url.PathEscape(name), version)
+			}
+		}
+	}
+	payload["fonts"] = map[string]string{
+		"regular_url": "/slides/fonts/regular.ttf",
+		"bold_url":    "/slides/fonts/bold.ttf",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		return
+	}
+}
+
+func (s *Service) handleGetSlidesFont(w http.ResponseWriter, r *http.Request) {
+	fontName := r.PathValue("name")
+	var bold bool
+	switch fontName {
+	case "regular.ttf":
+	case "bold.ttf":
+		bold = true
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	font, err := s.runner.Font(bold)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "font/ttf")
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	_, _ = w.Write(font)
+}
+
 func (s *Service) handleGetPPTX(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	doc, err := s.store.Get(id)
@@ -459,13 +582,14 @@ func (s *Service) handleListVersions(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0, len(vs))
 	for _, v := range vs {
 		item := map[string]any{
-			"version": v.Version, "script": v.Script, "pdf_key": v.PDFKey,
-			"cover_key": v.CoverKey, "pptx_key": v.PPTXKey, "manifest": v.Manifest, "created_at": v.CreatedAt,
-			"pdf_url":   fmt.Sprintf("/docs/%s/pdf?version=%d", r.PathValue("id"), v.Version),
+			"version": v.Version, "script": v.Script, "pdf_key": v.PDFKey, "cover_key": v.CoverKey,
+			"pptx_key": v.PPTXKey, "slides_key": v.SlidesKey, "manifest": v.Manifest, "created_at": v.CreatedAt,
 			"cover_url": fmt.Sprintf("/docs/%s/cover?version=%d", r.PathValue("id"), v.Version),
+			"pdf_url":   fmt.Sprintf("/docs/%s/pdf?version=%d", r.PathValue("id"), v.Version),
 		}
 		if store.NormalizeType(doc.Type) == store.TypeSlideshow {
 			item["pptx_url"] = fmt.Sprintf("/docs/%s/pptx?version=%d", doc.ID, v.Version)
+			item["slides_url"] = fmt.Sprintf("/docs/%s/slides?version=%d", doc.ID, v.Version)
 		}
 		items = append(items, item)
 	}
@@ -533,6 +657,8 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /docs/{id}", auth(s.handleDelete))
 	mux.HandleFunc("GET /docs/{id}/pdf", auth(s.handleGetPDF))
 	mux.HandleFunc("GET /docs/{id}/pptx", auth(s.handleGetPPTX))
+	mux.HandleFunc("GET /docs/{id}/slides", auth(s.handleGetSlides))
+	mux.HandleFunc("GET /slides/fonts/{name}", auth(s.handleGetSlidesFont))
 	mux.HandleFunc("GET /docs/{id}/cover", auth(s.handleGetCover))
 	mux.HandleFunc("GET /docs/{id}/versions", auth(s.handleListVersions))
 	mux.HandleFunc("GET /docs/{id}/manifest", auth(s.handleListElements))

@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -310,6 +311,28 @@ func (s *Service) handleGetImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prefix, _ := store.ProjectPrefix(id)
+	if requested := r.URL.Query().Get("version"); requested != "" {
+		version, err := strconv.Atoi(requested)
+		if err != nil || version < 1 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid version %q", requested))
+			return
+		}
+		doc, err := s.store.Get(id)
+		if err != nil {
+			writeDocumentError(w, err)
+			return
+		}
+		if _, ok := s.docVersion(doc, version); !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("version %d not found", version))
+			return
+		}
+		vp, err := store.VersionPrefix(id, version)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		prefix = path.Join(vp, "assets")
+	}
 	b, err := s.driver.Get(r.Context(), prefix+"/"+name)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {

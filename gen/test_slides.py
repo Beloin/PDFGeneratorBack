@@ -9,6 +9,26 @@ from slides import Slides
 
 
 class SlidesTests(unittest.TestCase):
+    def test_text_wraps_explicit_and_long_lines_to_box(self):
+        slides = Slides("unused.pdf")
+        slides.slide()
+        element = slides.text("one\n\ntwo veryveryverylongtoken", "copy", 20, 10, 70, 130,
+                              font_size=13.5)
+        self.assertEqual(element["lines"][0]["text"], "one")
+        self.assertEqual(element["lines"][1]["text"], "")
+        self.assertGreater(len(element["lines"]), 3)
+        from PIL import ImageFont
+        from slides import _font_path
+        font = ImageFont.truetype(_font_path(), 13.5)
+        self.assertTrue(all(font.getlength(line["text"]) <= 70 for line in element["lines"]))
+        self.assertTrue(all(line["y"] <= 140 for line in element["lines"]))
+
+    def test_rejects_text_box_narrower_than_one_glyph(self):
+        slides = Slides("unused.pdf")
+        slides.slide()
+        with self.assertRaisesRegex(ValueError, "too narrow to fit glyphs"):
+            slides.text("W", "tiny", 0, 0, 1, 30, font_size=24)
+
     def test_elements_create_pptx_and_pdf_point_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             output = os.path.join(directory, "deck.pdf")
@@ -22,13 +42,24 @@ class SlidesTests(unittest.TestCase):
             os.environ["PDF_ASSET_ROOT"] = "file://" + directory
             try:
                 slides.image("photo.png", "photo", 100, 100, width=120)
+                slides.save()
             finally:
                 if old_root is None:
                     os.environ.pop("PDF_ASSET_ROOT", None)
                 else:
                     os.environ["PDF_ASSET_ROOT"] = old_root
-            slides.save()
             self.assertTrue(os.path.isfile(output + ".pptx"))
+            self.assertTrue(os.path.isfile(output + ".cover.png"))
+            with Image.open(output + ".cover.png") as cover:
+                self.assertEqual(cover.size, (640, 360))
+            with open(output + ".slides.json", encoding="utf-8") as stream:
+                canonical = json.load(stream)
+            self.assertEqual(canonical["schema_version"], 1)
+            self.assertEqual(canonical["font_family"], "Vera")
+            self.assertEqual(canonical["fonts"], {"regular": "Vera.ttf", "bold": "VeraBd.ttf"})
+            self.assertEqual([element["id"] for element in canonical["slides"][0]["elements"]], ["panel", "title"])
+            self.assertEqual(canonical["slides"][0]["elements"][1]["lines"][0]["text"], "Title")
+            self.assertEqual(canonical["slides"][0]["elements"][1]["lines"][0]["x"], 30.0)
             with open(output + ".manifest.json", encoding="utf-8") as stream:
                 manifest = json.load(stream)
             self.assertEqual(manifest["page_size"], [960.0, 540.0])

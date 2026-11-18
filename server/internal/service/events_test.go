@@ -116,7 +116,11 @@ func TestRenderWebSocketEvents(t *testing.T) {
 				if completed["project_type"] != tc.kind {
 					t.Fatalf("project type: %v", completed)
 				}
-				for _, field := range []string{"pdf_url", "manifest_url", "cover_url"} {
+				fields := []string{"manifest_url", "cover_url", "pdf_url"}
+				if tc.kind == "slideshow" {
+					fields = append(fields, "slides_url")
+				}
+				for _, field := range fields {
 					endpoint, ok := completed[field].(string)
 					if !ok || endpoint == "" {
 						t.Fatalf("missing %s: %v", field, completed)

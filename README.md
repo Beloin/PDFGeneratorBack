@@ -1,14 +1,16 @@
-# Chat-edited PDF backend
+# Chat-edited PDF and slideshow backend
 
-Go owns projects, templates, PDFs, manifests, MCP tools, and WebSocket events. Rust runs the chat model/tool loop. Python renders scripts through the `Doc` wrapper. See [architecture](docs/architecture.md), [API](docs/backend-api.md), and [frontend guide](docs/frontend-guide.md).
+Go owns projects, templates, PDFs, slideshow scenes, manifests, MCP tools, and WebSocket events. Rust runs the chat model/tool loop. Python renders PDF scripts through `Doc` and slideshow scripts through `Slides`. See [architecture](docs/architecture.md), [API](docs/backend-api.md), and [frontend guide](docs/frontend-guide.md).
 
 ## Run locally
 
-Install LibreOffice Impress (the `libreoffice` executable) for slideshows. `heph run //server:run` first prepares its renderer dependencies, including `python-pptx==1.0.2`, in the interpreter configured by `server/.env` (`PDF_PYTHON`).
+Slideshow rendering uses python-pptx and LibreOffice headless. Install LibreOffice with Impress support on the host; BUILD exposes `libreoffice` and its launcher utilities as Heph tools. `heph run //server:run` exposes the installed converter and prepares Python dependencies in the interpreter configured by `server/.env` (`PDF_PYTHON`).
 
-Install Poppler utilities (`pdftoppm` and `pdftotext`; Debian/Ubuntu package `poppler-utils`) on the server host. Covers use the first PDF page; PDF source ingestion extracts text without OCR.
+LibreOffice exports PDFs without registration watermarks. Each conversion uses an isolated temporary profile so parallel renders do not share a running office process.
 
-Each project owns its configuration: copy `server/.env.example`, `chat/.env.example`, and `gen/.env.example` to `.env` in the same directory. Set the server data and Python paths, generator venv path, and chat model and API key. Existing local values and credentials have been preserved in those project files.
+Install Poppler utilities (`pdftoppm` and `pdftotext`; Debian/Ubuntu package `poppler-utils`) on the server host. PDF previews for both project types are converted documents; `pdftoppm` produces their default PNG covers. PDF source ingestion extracts text without OCR. Pillow cover output is supplementary and is not the default project cover.
+
+Each project owns its configuration: copy `server/.env.example`, `chat/.env.example`, and `gen/.env.example` to `.env` in the same directory. Set the server data and Python paths, generator venv path, and chat model and API key. `LIBREOFFICE` is optional for direct runs that need to override the installed LibreOffice executable path; BUILD passes it through to the renderer. Existing local values and credentials have been preserved in those project files.
 
 ```bash
 heph run //gen:venv
@@ -53,13 +55,13 @@ curl -s -X POST http://localhost:8080/docs \
 curl http://localhost:8080/docs
 ```
 
-`POST /docs` renders version 1 before returning. Its response includes `doc_id`, `pdf_url`, `cover_url`, and `manifest_url`. The frontend opens those URLs, subscribes to `/ws`, and sends edits to Rust `POST /chat/stream`. The model saves a draft with `edit_script` and commits it with `render`.
+`POST /docs` renders version 1 before returning. PDF metadata includes `doc_id`, `pdf_url`, `cover_url`, and `manifest_url`. Slideshow metadata includes these same viewer URLs plus `pptx_url`; `slides_url` offers the canonical scene JSON as an additive API. The frontend subscribes to `/ws` and sends edits to Rust `POST /chat/stream`. The model saves a draft with `edit_script` and commits it with `render`.
 
 The gallery includes `business` (business strategy slides) and `metrics` (an illustrative metrics review), alongside `empty`, `report`, and `slideshow`.
 
 ## PDF and slideshow projects
 
-`POST /docs` accepts `type: "pdf"` or `type: "slideshow"`. PDF projects use ReportLab. Slideshow projects use python-pptx, then LibreOffice creates the PDF preview. Both share the viewer, selection manifest, cover, assets, and version history. Slideshow metadata includes `pptx_url` for editable PowerPoint downloads.
+`POST /docs` accepts `type: "pdf"` or `type: "slideshow"`. PDF projects use ReportLab. Slideshow projects use python-pptx and LibreOffice headless to provide the same PDF viewer workflow, alongside editable PowerPoint downloads. The versioned canonical scene JSON is additive; frontend clients do not need to build a slide renderer. Both types share the existing selection manifest, assets, and version history.
 
 For example: `{"type":"slideshow","template":"business-pptx","title":"Business plan"}`. New slideshow template IDs are `slideshow-pptx`, `business-pptx`, and `metrics-pptx`. The older template IDs and projects retain their PDF scripts. Omitting the type infers it from the template; omitting both creates a blank PDF.
 
@@ -67,7 +69,7 @@ For example: `{"type":"slideshow","template":"business-pptx","title":"Business p
 
 Upload reference PDF or Markdown files to `POST /docs/{id}/sources` as multipart field `file`. PDFs become Markdown text for the model’s `list_sources` and `get_source` tools. Text extraction does not preserve arbitrary PDF layouts; scanned PDFs need OCR before upload.
 
-Chat accepts JSON or multipart fields `message`, `doc_id`, optional `system`, `selection`/`selections` JSON, and repeated `images` files. Uploaded PNG/JPEG files become document assets that the model can insert with `doc.image(name, element_id, width=None, height=None)`. Dimensions are PDF points; one dimension preserves aspect ratio. See the [frontend guide](docs/frontend-guide.md) for requests and history.
+Chat accepts JSON or multipart fields `message`, `doc_id`, optional `system`, `selection`/`selections` JSON, and repeated `images` files. Uploaded PNG/JPEG files become document assets that the model can insert with `doc.image(...)` in PDF projects or `Slides.image(...)` in slideshows. Dimensions use points; one omitted image dimension preserves aspect ratio. See the [frontend guide](docs/frontend-guide.md) for requests and history.
 
 ## Heph
 
@@ -89,6 +91,6 @@ The Python runner has a timeout and reduced environment but no public-use sandbo
 
 ## Slideshow verification
 
-With `PDF_PYTHON` exported from the server configuration and LibreOffice installed, run `go test -v ./internal/service -run TestRealSlideshowProjectLifecycle` from `server/`. This verifies a real slideshow project, PPTX download, PDF preview, cover, manifest, and rebuilding a missing historical deck. Environments that prohibit Unix socket binding cannot start LibreOffice; this integration test reports an explicit skip there. Python tests separately verify real PPTX generation and exercise conversion orchestration with a test converter.
+Slideshow PDF previews and PPTX files render through the Heph-provided LibreOffice tool. Run the Go service tests and Python slideshow tests with the configured `PDF_PYTHON`; `slides_url` remains available for clients that need versioned scene geometry.
 
 `//server:run` depends on the uncached `//server:renderer` setup target. Setup installs `gen/requirements.txt` using the server’s own `PDF_PYTHON` and checks imports before Go starts. This is independent of `//gen:venv`, which uses `gen/.env`. The configured server interpreter must already exist; point it at a virtual environment.

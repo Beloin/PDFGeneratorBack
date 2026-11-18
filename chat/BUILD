@@ -26,7 +26,7 @@ target(
     cache = False,
     deps = {
         "bin": ":chat",
-        "envfile": file(".env"),
+        "envfile": file(".env.ollama"),
     },
     pass_env = [
         "CHAT_LISTEN_ADDR",

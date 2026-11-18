@@ -50,19 +50,25 @@ PDF (`type: pdf`): The script uses ReportLab through `Doc` (`from doc import
 Doc`). Coordinates and image dimensions are points. Add an uploaded image with
 `Doc.image(name, element_id, width=None, height=None)`; omit one dimension to
 preserve aspect ratio. For SVGs, call `add_svg` (doc_id, name, svg), then use
-`doc.svg('name', 'element-id')`.
+`doc.svg('name', 'element-id')`. SVG insertion applies to PDF projects only.
 
 Slideshow (`type: slideshow`): Use `Slides` from `slides` (`from
 slides import Slides`), backed by python-pptx; do not use `Doc`, ReportLab, or
 PDF drawing APIs. Keep the existing Slides setup and save flow; when creating
-it, use `Slides(OUT_PATH, width=960, height=540)`. Coordinates are points with
-a top-left origin. Use only these methods: `slide(background='#...')`,
+it, default to `Slides(OUT_PATH, width=960, height=540)`, and change the canvas
+only when the user asks. Coordinates are points with
+a top-left origin. Use font family Vera. Use only these methods: `slide(background='#...')`,
 `text(text, element_id, x, y, width, height, font_size=..., color=...,
 bold=False)`, `rect(element_id, x, y, width, height, fill=..., line=...)`, and
 `image(name, element_id, x, y, width=None, height=None)`. Use `slide` to add a
 slide, preserve aspect ratio when one image dimension is omitted, and call
-`save()` when required by the existing flow. The wrapper saves PPTX and
-converts it to PDF during render.
+`save()` when required by the existing flow. The wrapper produces editable
+PPTX and canonical scene JSON. The backend converts the PPTX to the PDF preview
+and creates its cover; use the existing `pdf_url`, `manifest_url`, `cover_url`,
+and `pptx_url` from project metadata. Scene JSON is additive and does not
+require frontend rendering work. Do not add export code to the script.
+Preserve existing element IDs and use only supported text, rectangle, and
+raster-image elements.
 
 When done, reply with a short plain-text summary; do not dump the whole script.";
 
@@ -740,6 +746,12 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("Coordinates are points with"));
         assert!(SYSTEM_PROMPT.contains("Slides(OUT_PATH, width=960, height=540)"));
         assert!(SYSTEM_PROMPT.contains("rect(element_id, x, y, width, height"));
+        assert!(SYSTEM_PROMPT.contains("backend converts the PPTX to the PDF preview"));
+        assert!(SYSTEM_PROMPT.contains("Scene JSON is additive"));
+        assert!(SYSTEM_PROMPT.contains("do not use `Doc`, ReportLab"));
+        assert!(!SYSTEM_PROMPT.contains("pptx` uses"));
+        assert!(SYSTEM_PROMPT.contains("Vera"));
+        assert!(SYSTEM_PROMPT.contains("SVG insertion applies to PDF projects only"));
     }
 
     #[test]

@@ -53,7 +53,7 @@ target(
         "//@heph/bin:pdftoppm",
         "//@heph/bin:pdftotext",
         "//@heph/bin:libreoffice",
-        # LibreOffice's launcher resolves its installation using these commands.
+        # LibreOffice's launcher locates its installation with these commands.
         "//@heph/bin:dirname",
         "//@heph/bin:basename",
         "//@heph/bin:ls",
@@ -66,6 +66,7 @@ target(
         "PDF_DATA_DIR",
         "PDF_GEN_PATH",
         "PDF_PYTHON",
+        "LIBREOFFICE",
         "AUTH_TOKEN",
         "PYENV_ROOT",
         "PYENV_VERSION",
@@ -75,6 +76,7 @@ set -a
 source "$SRC_ENVFILE"
 set +a
 export PDF_GEN_PATH="${PDF_GEN_PATH:-$SRC_RUNPY}"
+export LIBREOFFICE="${LIBREOFFICE:-$(command -v libreoffice)}"
 exec "$SRC_BIN"
 ''',
 )

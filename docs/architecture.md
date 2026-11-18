@@ -11,7 +11,7 @@ flowchart LR
     Rust -->|optional chat history| DB[(Postgres)]
     Go -->|storage keys| Driver[Driver interface]
     Driver --> FS[(DriverFS: repo tmp/)]
-    Go -->|subprocess with staged assets| Python[Python Doc runner]
+    Go -->|subprocess with staged assets| Python[Python Doc or Slides runner]
 ```
 
 ## Storage
@@ -33,19 +33,21 @@ tmp/
       script.py
       manifest.json
       pdf_render.pdf
+      slides.pptx (slideshow projects)
       cover.png
+      slides.pptx
       assets/{asset_name}.{svg,png,jpg}
 ```
 
-`project.json` holds the draft, project metadata, and the version index. On render, Go stages project SVGs and raster images in Python's temporary working directory, then saves a snapshot under the version. A missing historical PDF rebuilds with that version's script and asset snapshot. There is no separate current-PDF copy. `PDF_DATA_DIR` or `-data-dir` changes the driver root. Clearing `tmp/` deletes projects; there is no migration from the former Postgres document store. Rust chat history remains optional Postgres data.
+`project.json` holds the draft, project metadata, and the version index. On render, Go stages project SVGs and raster images in Python's temporary working directory, then saves a snapshot under the version. Every version has `pdf_render.pdf`; slideshow versions also store editable `slides.pptx` and canonical scene data. Both store the existing manifest and a PNG cover generated from the converted PDF with `pdftoppm`. A Pillow-generated slideshow cover is supplementary. `PDF_DATA_DIR` or `-data-dir` changes the driver root. Clearing `tmp/` deletes projects; there is no migration from the former Postgres document store. Rust chat history remains optional Postgres data.
 
 ## Lifecycle
 
-1. Startup seeds `empty`, `report`, `slideshow`, `business`, and `metrics` template files only when missing, and generates missing first-page covers. No demo projects are seeded. Template files have no editing API. The two new presentation templates each render four 16:9 slides.
+1. Startup seeds the existing PDF templates (`empty`, `report`, `slideshow`, `business`, `metrics`) and native slideshow templates (`slideshow-pptx`, `business-pptx`, `metrics-pptx`) only when missing, and generates missing covers. No demo projects are seeded. Template files have no editing API. Native slideshow templates each render four 16:9 slides.
 2. `POST /docs` copies a stored template into a new project and renders version 1. A failed initial render removes the incomplete project.
-3. `edit_script` saves a draft when `base_version` matches the current version. `render` commits the draft as a new version, executes Python, stores the PDF, first-page PNG cover, and manifest, then broadcasts `pdf_updated`. A failed later render leaves a version without output and broadcasts `pdf_failed`.
+3. `edit_script` saves a draft when `base_version` matches the current version. `render` commits the draft as a new version and executes Python. The backend converts the generated PDF or slideshow PPTX to the versioned PDF preview; slideshow renders also store the editable PPTX and canonical scene JSON. Both store a PNG cover derived from the converted PDF and the existing manifest, then broadcast `pdf_updated`. A failed later render leaves a version without output and broadcasts `pdf_failed`.
 4. `restore_version` copies an older script into the draft; a later render makes a new version. `add_svg` writes an editable SVG at the project root. Rendering snapshots it for rebuilds.
-5. The browser reads PDF and manifest URLs from project metadata and watches `/ws`. Events are hints: the browser refetches after an update or reconnect.
+5. The browser reads PDF and manifest URLs from project metadata and watches `/ws`. Both project types use the PDF viewer. Slideshow projects also offer the editable PPTX download. The optional scene endpoint serves canonical data for clients that need it; the default frontend does not need its own slide renderer. Events are hints: the browser refetches after an update or reconnect.
 
 The manifest maps stable element IDs to page, bounding box, type, and source line. Coordinates are PDF points from the bottom-left corner. A split element has several entries under one ID.
 
@@ -65,8 +67,8 @@ Rust accepts JSON or multipart chat requests. Multipart PNG/JPEG attachments are
 
 ## Slideshow rendering
 
-Projects persist a `type` of `pdf` or `slideshow`; legacy records default to `pdf`. PDF scripts use ReportLab `Doc`. Slideshow scripts use the `Slides` wrapper over python-pptx, which records shape IDs, slide numbers, source lines, and PDF-coordinate bounding boxes. The runner converts the deck using headless LibreOffice with an isolated temporary profile, then creates the first-page cover with Poppler.
+Projects persist a `type` of `pdf` or `slideshow`; legacy records default to `pdf`. PDF scripts use ReportLab `Doc`. Slideshow scripts use the `Slides` wrapper over python-pptx, which records shape IDs, slide numbers, source lines, and PDF-coordinate bounding boxes. The slideshow scene API returns schema version 1 with canvas dimensions (960x540 by default), Vera font URLs, and per-slide text, rectangle, and raster image elements. Scene coordinates are top-left points; text line positions are absolute top-left baselines. The backend converts slideshows to PDF with the Heph-provided LibreOffice tool. The default UI uses that PDF and the unchanged manifest; scene data and Vera font endpoints are optional.
 
-Every slideshow version stores `slides.pptx` beside `pdf_render.pdf`, `manifest.json`, and `cover.png`. Saved scripts and asset snapshots rebuild either format without changing the version. Template seeding adds separate native slideshow templates; it does not rewrite existing PDF templates or project scripts. The chat prompt reads `get_script.type` before editing to select the matching Python API.
+Every slideshow version stores `pdf_render.pdf`, an editable `slides.pptx`, scene data, `manifest.json`, and the PDF-derived `cover.png`. Saved scripts and asset snapshots rebuild the versioned outputs without changing the version. Template seeding adds separate native slideshow templates; it does not rewrite existing PDF templates or project scripts. The chat prompt reads `get_script.type` before editing to select the matching Python API. `pdf_updated` remains the event name; slideshow events retain `pdf_url`, `cover_url`, and `manifest_url`, and add `project_type`, `slides_url`, and `pptx_url`.
 
-Before starting Go, `//server:run` runs `//server:renderer`. This uncached setup reads `server/.env`, installs the pinned renderer requirements into `PDF_PYTHON`, and verifies imports. The generator’s separate `//gen:venv` target continues to use `gen/.env`; its environment does not select the server interpreter.
+Before starting Go, `//server:run` runs `//server:renderer` and exposes the installed LibreOffice tool. BUILD exposes the installed LibreOffice executable and the utilities its launcher needs. Renderer setup reads `server/.env`, installs pinned Python requirements into `PDF_PYTHON`, and verifies imports. `LIBREOFFICE` optionally overrides the executable for direct runs and is passed to the runner child process. The generator’s separate `//gen:venv` target continues to use `gen/.env`; its environment does not select the server interpreter.

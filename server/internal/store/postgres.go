@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS script_versions (
     pdf_path   TEXT NOT NULL DEFAULT '',
     cover_path TEXT NOT NULL DEFAULT '',
     pptx_path  TEXT NOT NULL DEFAULT '',
+    slides_path TEXT NOT NULL DEFAULT '',
     manifest   TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (doc_id, version)
@@ -43,6 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_messages_doc ON chat_messages (doc_id, id);
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'pdf';
 ALTER TABLE script_versions ADD COLUMN IF NOT EXISTS cover_path TEXT NOT NULL DEFAULT '';
 ALTER TABLE script_versions ADD COLUMN IF NOT EXISTS pptx_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE script_versions ADD COLUMN IF NOT EXISTS slides_path TEXT NOT NULL DEFAULT '';
 `
 
 // Postgres is a Store backed by the shared Postgres database.
@@ -213,11 +215,11 @@ func (p *Postgres) Commit(id string) (ScriptVersion, error) {
 	return ScriptVersion{Version: v, Script: draft, CreatedAt: now}, nil
 }
 
-func (p *Postgres) RecordOutput(id string, version int, pdfPath, coverPath, pptxPath, manifest string) error {
+func (p *Postgres) RecordOutput(id string, version int, output Output) error {
 	ctx := context.Background()
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE script_versions SET pdf_path = $3, cover_path = $4, pptx_path = $5, manifest = $6 WHERE doc_id = $1 AND version = $2`,
-		id, version, pdfPath, coverPath, pptxPath, manifest,
+		`UPDATE script_versions SET pdf_path = CASE WHEN $3 = '' THEN pdf_path ELSE $3 END, cover_path = $4, pptx_path = $5, slides_path = $6, manifest = $7 WHERE doc_id = $1 AND version = $2`,
+		id, version, output.PDFKey, output.CoverKey, output.PPTXKey, output.SlidesKey, output.Manifest,
 	)
 	if err != nil {
 		return err
@@ -231,7 +233,7 @@ func (p *Postgres) RecordOutput(id string, version int, pdfPath, coverPath, pptx
 func (p *Postgres) ListVersions(id string) ([]ScriptVersion, error) {
 	ctx := context.Background()
 	rows, err := p.pool.Query(ctx,
-		`SELECT version, script, pdf_path, cover_path, pptx_path, manifest, created_at FROM script_versions WHERE doc_id = $1 ORDER BY version`, id,
+		`SELECT version, script, pdf_path, cover_path, pptx_path, slides_path, manifest, created_at FROM script_versions WHERE doc_id = $1 ORDER BY version`, id,
 	)
 	if err != nil {
 		return nil, err
@@ -240,7 +242,7 @@ func (p *Postgres) ListVersions(id string) ([]ScriptVersion, error) {
 	var vs []ScriptVersion
 	for rows.Next() {
 		var v ScriptVersion
-		if err := rows.Scan(&v.Version, &v.Script, &v.PDFKey, &v.CoverKey, &v.PPTXKey, &v.Manifest, &v.CreatedAt); err != nil {
+		if err := rows.Scan(&v.Version, &v.Script, &v.PDFKey, &v.CoverKey, &v.PPTXKey, &v.SlidesKey, &v.Manifest, &v.CreatedAt); err != nil {
 			return nil, err
 		}
 		vs = append(vs, v)
@@ -264,9 +266,9 @@ func (p *Postgres) Restore(id string, version int) (ScriptVersion, error) {
 
 	var src ScriptVersion
 	if err := tx.QueryRow(ctx,
-		`SELECT version, script, pdf_path, cover_path, pptx_path, manifest, created_at FROM script_versions WHERE doc_id = $1 AND version = $2`,
+		`SELECT version, script, pdf_path, cover_path, pptx_path, slides_path, manifest, created_at FROM script_versions WHERE doc_id = $1 AND version = $2`,
 		id, version,
-	).Scan(&src.Version, &src.Script, &src.PDFKey, &src.CoverKey, &src.PPTXKey, &src.Manifest, &src.CreatedAt); err != nil {
+	).Scan(&src.Version, &src.Script, &src.PDFKey, &src.CoverKey, &src.PPTXKey, &src.SlidesKey, &src.Manifest, &src.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ScriptVersion{}, fmt.Errorf("version %d not found in document %q", version, id)
 		}

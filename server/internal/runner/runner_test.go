@@ -1,14 +1,14 @@
 package runner
 
 import (
-	"errors"
-	"net"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
+
+	"image/png"
 )
 
 func TestRunResolvesRelativeRunnerPathBeforeChangingDirectory(t *testing.T) {
@@ -54,18 +54,7 @@ func TestRunRendersFirstPageToPNG(t *testing.T) {
 	}
 }
 
-func TestRunTypeSlideshowProducesEditableDeckAndPDF(t *testing.T) {
-	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "office.sock"))
-	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
-		t.Skip("sandbox denies Unix socket binding required by LibreOffice")
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener.Close()
-	if _, err := exec.LookPath("libreoffice"); err != nil {
-		t.Skip("libreoffice is required for slideshow rendering")
-	}
+func TestRunTypeSlideshowConvertsPPTXToPDF(t *testing.T) {
 	py := os.Getenv("PDF_PYTHON")
 	if py == "" {
 		py = "python3"
@@ -73,7 +62,38 @@ func TestRunTypeSlideshowProducesEditableDeckAndPDF(t *testing.T) {
 	if err := exec.Command(py, "-c", "import pptx").Run(); err != nil {
 		t.Skip("python-pptx unavailable")
 	}
+	resolved, err := exec.LookPath(py)
+	if err != nil {
+		t.Fatal(err)
+	}
+	py, err = filepath.Abs(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ppm, err := exec.LookPath("pdftoppm")
+	if err != nil {
+		t.Skip("pdftoppm unavailable")
+	}
+	converter := filepath.Join(t.TempDir(), "libreoffice")
+	stub := "#!" + py + `
+import sys
+from pathlib import Path
+from zipfile import ZipFile
+from reportlab.pdfgen import canvas
+with ZipFile(sys.argv[-1]) as deck:
+    assert "ppt/slides/slide1.xml" in deck.namelist()
+output=str(Path(sys.argv[sys.argv.index("--outdir")+1]) / (Path(sys.argv[-1]).stem+".pdf"))
+c=canvas.Canvas(output,pagesize=(960,540))
+c.drawString(30,480,"Converted slideshow")
+c.save()
+`
+	if err := os.WriteFile(converter, []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIBREOFFICE", converter)
+	t.Setenv("PATH", "")
 	r := New("../../../gen/run.py", py)
+	r.PDFToPPM = ppm
 	result, err := r.RunType("from slides import Slides\ns = Slides(OUT_PATH)\ns.slide('#102030')\ns.text('Editable title', 'title', 30, 30, 400, 60, font_size=32)\ns.save()", nil, "slideshow")
 	if err != nil {
 		t.Fatal(err)
@@ -81,13 +101,69 @@ func TestRunTypeSlideshowProducesEditableDeckAndPDF(t *testing.T) {
 	if !result.OK {
 		t.Fatalf("slideshow render failed: %s", result.Traceback)
 	}
-	if len(result.PDF) < 5 || string(result.PDF[:5]) != "%PDF-" {
-		t.Fatalf("invalid PDF output: %d bytes", len(result.PDF))
-	}
 	if len(result.PPTX) < 4 || string(result.PPTX[:2]) != "PK" {
 		t.Fatalf("invalid PPTX output: %d bytes", len(result.PPTX))
 	}
 	if !strings.Contains(result.Manifest, `"id": "title"`) && !strings.Contains(result.Manifest, `"id":"title"`) {
 		t.Fatalf("manifest missing source element: %s", result.Manifest)
+	}
+	var slides struct {
+		SchemaVersion int     `json:"schema_version"`
+		Width         float64 `json:"width"`
+		Height        float64 `json:"height"`
+		Slides        []struct {
+			Page     int `json:"page"`
+			Elements []struct {
+				ID    string `json:"id"`
+				Lines []struct {
+					X float64 `json:"x"`
+					Y float64 `json:"y"`
+				} `json:"lines"`
+			} `json:"elements"`
+		} `json:"slides"`
+	}
+	if err := json.Unmarshal([]byte(result.SlidesJSON), &slides); err != nil {
+		t.Fatal(err)
+	}
+	if slides.SchemaVersion != 1 || slides.Width != 960 || slides.Height != 540 || len(slides.Slides) != 1 || slides.Slides[0].Page != 1 || slides.Slides[0].Elements[0].ID != "title" || len(slides.Slides[0].Elements[0].Lines) != 1 {
+		t.Fatalf("unexpected slide JSON: %s", result.SlidesJSON)
+	}
+	if !strings.HasPrefix(string(result.PDF), "%PDF-") {
+		t.Fatal("slideshow did not return the converted PDF")
+	}
+	cover, err := png.DecodeConfig(strings.NewReader(string(result.CoverPNG)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cover.Width != 640 || cover.Height != 360 {
+		t.Fatalf("cover size %dx%d; want 640x360", cover.Width, cover.Height)
+	}
+}
+
+func TestSlidesJSONValidationRejectsMalformedArtifact(t *testing.T) {
+	for _, data := range [][]byte{nil, []byte("{}"), []byte(`{"schema_version":1,"width":960,"height":540,"font_family":"Vera","fonts":{"regular":"Vera.ttf","bold":"VeraBd.ttf"},"slides":[]}`)} {
+		if err := validateSlidesJSON(data); err == nil {
+			t.Fatalf("accepted malformed slides JSON: %q", data)
+		}
+	}
+}
+
+func TestRunnerReturnsVeraFonts(t *testing.T) {
+	py := os.Getenv("PDF_PYTHON")
+	if py == "" {
+		py = "python3"
+	}
+	if err := exec.Command(py, "-c", "import reportlab").Run(); err != nil {
+		t.Skip("ReportLab unavailable")
+	}
+	r := New("unused", py)
+	for _, bold := range []bool{false, true} {
+		data, err := r.Font(bold)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) < 4 || string(data[:4]) != "\x00\x01\x00\x00" {
+			t.Fatalf("unexpected Vera font signature (%t): %x", bold, data[:min(len(data), 4)])
+		}
 	}
 }

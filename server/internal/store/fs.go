@@ -242,7 +242,7 @@ func (s *FS) Commit(id string) (ScriptVersion, error) {
 	return v, nil
 }
 
-func (s *FS) RecordOutput(id string, version int, pdfKey, coverKey, pptxKey, manifest string) error {
+func (s *FS) RecordOutput(id string, version int, output Output) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, err := s.read(id)
@@ -263,10 +263,16 @@ func (s *FS) RecordOutput(id string, version int, pdfKey, coverKey, pptxKey, man
 	if index < 0 {
 		return fmt.Errorf("version %d not found in document %q", version, id)
 	}
-	if err := s.driver.Put(context.Background(), path.Join(vp, "manifest.json"), []byte(manifest)); err != nil {
+	if err := s.driver.Put(context.Background(), path.Join(vp, "manifest.json"), []byte(output.Manifest)); err != nil {
 		return err
 	}
-	d.Versions[index].PDFKey, d.Versions[index].CoverKey, d.Versions[index].PPTXKey, d.Versions[index].Manifest = pdfKey, coverKey, pptxKey, manifest
+	if output.PDFKey != "" {
+		d.Versions[index].PDFKey = output.PDFKey
+	}
+	d.Versions[index].CoverKey = output.CoverKey
+	d.Versions[index].PPTXKey = output.PPTXKey
+	d.Versions[index].SlidesKey = output.SlidesKey
+	d.Versions[index].Manifest = output.Manifest
 	d.Ready = true
 	d.UpdatedAt = time.Now().UTC()
 	return s.write(d)

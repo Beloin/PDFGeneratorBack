@@ -53,8 +53,10 @@ func TestRealRenderingWithUploadedImageAndSource(t *testing.T) {
 	for id := range Templates {
 		if templateType(id) == "slideshow" {
 			t.Run(id+"-cover", func(t *testing.T) {
-				if !slideshowConversionAvailable(t) {
-					t.Skip("sandbox denies Unix socket binding required by LibreOffice")
+				if os.Getenv("LIBREOFFICE") == "" {
+					if _, err := exec.LookPath("libreoffice"); err != nil {
+						t.Skip("LibreOffice is not configured")
+					}
 				}
 				if err := exec.Command(python, "-c", "import pptx").Run(); err != nil {
 					t.Skip("python-pptx unavailable")

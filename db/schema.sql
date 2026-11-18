@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS script_versions (
     pdf_path   TEXT NOT NULL DEFAULT '',
     cover_path TEXT NOT NULL DEFAULT '',
     pptx_path  TEXT NOT NULL DEFAULT '',
+    slides_path TEXT NOT NULL DEFAULT '',
     manifest   TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (doc_id, version)
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS script_versions (
 ALTER TABLE script_versions ADD COLUMN IF NOT EXISTS cover_path TEXT NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'pdf';
 ALTER TABLE script_versions ADD COLUMN IF NOT EXISTS pptx_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE script_versions ADD COLUMN IF NOT EXISTS slides_path TEXT NOT NULL DEFAULT '';
 
 -- Chat messages: the full conversation, shared by the chat harness.
 CREATE TABLE IF NOT EXISTS chat_messages (

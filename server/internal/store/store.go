@@ -16,8 +16,18 @@ type ScriptVersion struct {
 	PDFKey    string    `json:"pdf_key,omitempty"`
 	CoverKey  string    `json:"cover_key,omitempty"`
 	PPTXKey   string    `json:"pptx_key,omitempty"`
+	SlidesKey string    `json:"slides_key,omitempty"`
 	Manifest  string    `json:"manifest,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// Output contains the files and manifest produced for one committed version.
+type Output struct {
+	PDFKey    string
+	CoverKey  string
+	PPTXKey   string
+	SlidesKey string
+	Manifest  string
 }
 
 // Document is a set of script versions plus a working draft. The latest
@@ -51,6 +61,38 @@ func (d Document) Current() ScriptVersion {
 	return d.Versions[len(d.Versions)-1]
 }
 
+// RenderedVersion returns the newest complete output, or a legacy output that
+// can be completed lazily by the API.
+func (d Document) RenderedVersion() (ScriptVersion, bool) {
+	projectType := NormalizeType(d.Type)
+	for i := len(d.Versions) - 1; i >= 0; i-- {
+		v := d.Versions[i]
+		if v.RenderedFor(projectType) {
+			return v, true
+		}
+		if v.Manifest == "" {
+			continue
+		}
+		if projectType == TypeSlideshow && v.PPTXKey != "" && v.CoverKey != "" {
+			return v, true
+		}
+		if projectType == TypePDF && v.PDFKey != "" {
+			return v, true
+		}
+	}
+	return ScriptVersion{}, false
+}
+
+func (v ScriptVersion) RenderedFor(projectType string) bool {
+	if v.Manifest == "" || v.CoverKey == "" {
+		return false
+	}
+	if NormalizeType(projectType) == TypeSlideshow {
+		return v.PDFKey != "" && v.PPTXKey != "" && v.SlidesKey != ""
+	}
+	return v.PDFKey != ""
+}
+
 // Store is the document/version persistence interface.
 type Store interface {
 	Create(script string) (Document, error)
@@ -64,7 +106,7 @@ type Store interface {
 	Edit(id string, baseVersion int, script string) error
 	// Commit appends the draft as a new head version.
 	Commit(id string) (ScriptVersion, error)
-	RecordOutput(id string, version int, pdfKey, coverKey, pptxKey, manifest string) error
+	RecordOutput(id string, version int, output Output) error
 	ListVersions(id string) ([]ScriptVersion, error)
 	Restore(id string, version int) (ScriptVersion, error)
 }
@@ -198,7 +240,7 @@ func (s *Memory) Commit(id string) (ScriptVersion, error) {
 }
 
 // RecordOutput attaches a rendered PDF + manifest to an existing version.
-func (s *Memory) RecordOutput(id string, version int, pdfKey, coverKey, pptxKey, manifest string) error {
+func (s *Memory) RecordOutput(id string, version int, output Output) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, ok := s.docs[id]
@@ -207,10 +249,13 @@ func (s *Memory) RecordOutput(id string, version int, pdfKey, coverKey, pptxKey,
 	}
 	for i := range d.Versions {
 		if d.Versions[i].Version == version {
-			d.Versions[i].PDFKey = pdfKey
-			d.Versions[i].CoverKey = coverKey
-			d.Versions[i].PPTXKey = pptxKey
-			d.Versions[i].Manifest = manifest
+			if output.PDFKey != "" {
+				d.Versions[i].PDFKey = output.PDFKey
+			}
+			d.Versions[i].CoverKey = output.CoverKey
+			d.Versions[i].PPTXKey = output.PPTXKey
+			d.Versions[i].SlidesKey = output.SlidesKey
+			d.Versions[i].Manifest = output.Manifest
 			d.Ready = true
 			d.UpdatedAt = time.Now().UTC()
 			return nil

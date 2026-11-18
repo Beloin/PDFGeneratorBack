@@ -9,6 +9,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,12 +35,13 @@ func New(pyPath, python string) *Runner {
 
 // Result is the outcome of one run.
 type Result struct {
-	OK        bool   `json:"ok"`
-	Manifest  string `json:"manifest,omitempty"`
-	PDF       []byte `json:"-"` // rendered PDF bytes; not serialized to JSON
-	PPTX      []byte `json:"-"` // editable slideshow deck; not serialized to JSON
-	CoverPNG  []byte `json:"-"` // first page rendered as PNG
-	Traceback string `json:"traceback,omitempty"`
+	OK         bool   `json:"ok"`
+	Manifest   string `json:"manifest,omitempty"`
+	SlidesJSON string `json:"slides_json,omitempty"`
+	PDF        []byte `json:"-"` // rendered PDF bytes; not serialized to JSON
+	PPTX       []byte `json:"-"` // editable slideshow deck; not serialized to JSON
+	CoverPNG   []byte `json:"-"` // first page rendered as PNG
+	Traceback  string `json:"traceback,omitempty"`
 }
 
 // Run executes script and returns the rendered PDF + manifest or a traceback.
@@ -107,6 +109,28 @@ func (r *Runner) RunType(script string, assets map[string][]byte, projectType st
 			if err != nil {
 				return Result{}, fmt.Errorf("read rendered PPTX: %w", err)
 			}
+			slides, err := os.ReadFile(outPath + ".slides.json")
+			if err != nil {
+				return Result{}, fmt.Errorf("read slide JSON: %w", err)
+			}
+			cover, err := os.ReadFile(outPath + ".cover.png")
+			if err != nil {
+				return Result{}, fmt.Errorf("read rendered slide cover: %w", err)
+			}
+			if err := validateSlidesJSON(slides); err != nil {
+				return Result{}, err
+			}
+			if err := validateManifest([]byte(res.Manifest)); err != nil {
+				return Result{}, err
+			}
+			if len(pptx) < 4 || !bytes.Equal(pptx[:2], []byte("PK")) {
+				return Result{}, fmt.Errorf("rendered PPTX is invalid")
+			}
+			if len(cover) < 8 || !bytes.Equal(cover[:8], []byte("\x89PNG\r\n\x1a\n")) {
+				return Result{}, fmt.Errorf("rendered slide cover is invalid")
+			}
+			res.PPTX = pptx
+			res.SlidesJSON = string(slides)
 		}
 		pdf, err := os.ReadFile(outPath)
 		if err != nil {
@@ -146,6 +170,64 @@ func (r *Runner) RunType(script string, assets map[string][]byte, projectType st
 	return res, nil
 }
 
+func validateSlidesJSON(data []byte) error {
+	var payload struct {
+		SchemaVersion int               `json:"schema_version"`
+		Width         float64           `json:"width"`
+		Height        float64           `json:"height"`
+		FontFamily    string            `json:"font_family"`
+		Fonts         map[string]string `json:"fonts"`
+		Slides        []struct {
+			Page int `json:"page"`
+		} `json:"slides"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return fmt.Errorf("malformed slides JSON: %w", err)
+	}
+	if payload.SchemaVersion != 1 || payload.Width <= 0 || payload.Height <= 0 || payload.FontFamily != "Vera" || payload.Fonts["regular"] != "Vera.ttf" || payload.Fonts["bold"] != "VeraBd.ttf" || len(payload.Slides) == 0 {
+		return fmt.Errorf("slides JSON is missing required schema fields")
+	}
+	for i, slide := range payload.Slides {
+		if slide.Page != i+1 {
+			return fmt.Errorf("slides JSON has invalid page order")
+		}
+	}
+	return nil
+}
+
+func validateManifest(data []byte) error {
+	var manifest struct {
+		PageSize []float64         `json:"page_size"`
+		Elements []json.RawMessage `json:"elements"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return fmt.Errorf("malformed slideshow manifest: %w", err)
+	}
+	if len(manifest.PageSize) != 2 || manifest.PageSize[0] <= 0 || manifest.PageSize[1] <= 0 || manifest.Elements == nil {
+		return fmt.Errorf("slideshow manifest is missing required fields")
+	}
+	return nil
+}
+
+// Font returns the bundled Bitstream Vera font used by slide text rendering.
+func (r *Runner) Font(bold bool) ([]byte, error) {
+	filename := "Vera.ttf"
+	if bold {
+		filename = "VeraBd.ttf"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	code := "import os,sys; from reportlab import rl_config; name=sys.argv[1]; paths=[os.path.join(p,name) for p in rl_config.TTFSearchPath]; path=next((p for p in paths if os.path.isfile(p)),None); sys.stdout.buffer.write(open(path,'rb').read()) if path else sys.exit('bundled font not found: '+name)"
+	cmd := exec.CommandContext(ctx, r.Python, "-c", code, filename)
+	cmd.Env = scrubbedEnv(os.TempDir(), "")
+	var output, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("load bundled font %s: %s: %w", filename, stderr.String(), err)
+	}
+	return output.Bytes(), nil
+}
+
 // TODO: bsena; Use another service to create a runner that is focused only in creating that
 // scrubbedEnv builds a minimal environment with no host secrets.
 func scrubbedEnv(home, assetRoot string) []string {
@@ -160,7 +242,7 @@ func scrubbedEnv(home, assetRoot string) []string {
 
 	// Python version selectors (pyenv/venv) are needed to resolve the right
 	// interpreter; they carry no secrets.
-	for _, k := range []string{"PYENV_ROOT", "PYENV_VERSION", "PYENV_SHELL", "VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT"} {
+	for _, k := range []string{"PYENV_ROOT", "PYENV_VERSION", "PYENV_SHELL", "VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "LIBREOFFICE"} {
 		if v := os.Getenv(k); v != "" {
 			env = append(env, k+"="+v)
 		}

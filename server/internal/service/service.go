@@ -864,10 +864,21 @@ func (s *Service) run(docID string, version int, historical bool) *mcp.CallToolR
 			}
 		}
 	}
-	pdfKey := path.Join(vp, "pdf_render.pdf")
-	if err := s.driver.Put(context.Background(), pdfKey, res.PDF); err != nil {
-		s.hub.Publish(docID, ws.PDFFailed(docID, version, err.Error()))
-		return mcp.NewToolResultError(err.Error())
+	pdfKey := ""
+	slidesKey := ""
+	if doc.Type == store.TypeSlideshow {
+		slidesKey = path.Join(vp, "slides.json")
+		if err := s.driver.Put(context.Background(), slidesKey, []byte(res.SlidesJSON)); err != nil {
+			s.hub.Publish(docID, ws.PDFFailed(docID, version, err.Error()))
+			return mcp.NewToolResultError(err.Error())
+		}
+	}
+	if len(res.PDF) > 0 {
+		pdfKey = path.Join(vp, "pdf_render.pdf")
+		if err := s.driver.Put(context.Background(), pdfKey, res.PDF); err != nil {
+			s.hub.Publish(docID, ws.PDFFailed(docID, version, err.Error()))
+			return mcp.NewToolResultError(err.Error())
+		}
 	}
 	coverKey := path.Join(vp, "cover.png")
 	if err := s.driver.Put(context.Background(), coverKey, res.CoverPNG); err != nil {
@@ -882,25 +893,31 @@ func (s *Service) run(docID string, version int, historical bool) *mcp.CallToolR
 			return mcp.NewToolResultError(err.Error())
 		}
 	}
-	if err := s.store.RecordOutput(docID, version, pdfKey, coverKey, pptxKey, res.Manifest); err != nil {
+	if err := s.store.RecordOutput(docID, version, store.Output{PDFKey: pdfKey, CoverKey: coverKey, PPTXKey: pptxKey, SlidesKey: slidesKey, Manifest: res.Manifest}); err != nil {
 		s.hub.Publish(docID, ws.PDFFailed(docID, version, err.Error()))
 		return mcp.NewToolResultError(err.Error())
 	}
+	pdfURL := ""
+	if pdfKey != "" {
+		pdfURL = fmt.Sprintf("/docs/%s/pdf?version=%d", docID, version)
+	}
 	updated := ws.PDFUpdated(docID, version,
-		fmt.Sprintf("/docs/%s/pdf?version=%d", docID, version),
+		pdfURL,
 		fmt.Sprintf("/docs/%s/manifest?version=%d", docID, version))
 	updated["project_type"] = store.NormalizeType(doc.Type)
 	if pptxKey != "" {
 		updated["pptx_url"] = fmt.Sprintf("/docs/%s/pptx?version=%d", docID, version)
+		updated["slides_url"] = fmt.Sprintf("/docs/%s/slides?version=%d", docID, version)
 	}
 	s.hub.Publish(docID, updated)
 	return jsonResult(map[string]any{
-		"ok":        true,
-		"version":   version,
-		"pdf_key":   pdfKey,
-		"cover_key": coverKey,
-		"pptx_key":  pptxKey,
-		"manifest":  json.RawMessage(res.Manifest),
+		"ok":         true,
+		"version":    version,
+		"pdf_key":    pdfKey,
+		"cover_key":  coverKey,
+		"pptx_key":   pptxKey,
+		"slides_key": slidesKey,
+		"manifest":   json.RawMessage(res.Manifest),
 	})
 }
 

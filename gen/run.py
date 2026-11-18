@@ -1,26 +1,76 @@
 #!/usr/bin/env python3
-"""Run an AI-written Doc script and produce out.pdf + out.pdf.manifest.json.
+"""Run an AI-written PDF Doc or editable slideshow script.
 
 Usage: python run.py script.py out.pdf
 
-The script runs in a namespace with OUT_PATH set; it should do:
+For PDF scripts, the namespace exposes OUT_PATH and expects:
 
     from doc import Doc
     doc = Doc(OUT_PATH)
     ... doc.heading(...) / doc.paragraph(...) / ...
     doc.save()
 
+For slideshow scripts, Slides.save() writes out.pdf.slides.json, out.pdf.pptx,
+out.pdf.manifest.json, and out.pdf.cover.png. LibreOffice headless
+converts the generated PPTX to out.pdf for the browser preview.
+
 Any traceback is printed to stderr verbatim (the caller relays it to the
 model so it can self-correct). Exit code 0 on success, 1 on a script error.
 """
 
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import traceback
-from pathlib import Path
+
+
+def convert_slideshow(out_path):
+    """Convert the editable deck using the Heph-provided LibreOffice tool."""
+    configured = os.environ.get("LIBREOFFICE", "")
+    binary = shutil.which(configured or "libreoffice")
+    if not binary and not configured:
+        binary = shutil.which("soffice")
+    if not binary:
+        print("LibreOffice not found; install LibreOffice Impress or set LIBREOFFICE", file=sys.stderr)
+        return 1
+    with tempfile.TemporaryDirectory(prefix="pdf-editor-libreoffice-") as directory:
+        # Separate profiles prevent concurrent jobs from attaching to another process.
+        profile = Path(directory, "profile").as_uri()
+        converted_path = Path(directory, Path(out_path + ".pptx").stem + ".pdf")
+        # A stale preview must not make an unsuccessful conversion look valid.
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        try:
+            converted = subprocess.run(
+                [binary, "-env:UserInstallation=" + profile, "--headless", "--nologo",
+                 "--nodefault", "--norestore", "--convert-to", "pdf:impress_pdf_Export",
+                 "--outdir", directory, out_path + ".pptx"],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            print("LibreOffice slideshow conversion timed out after 20 seconds", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print("could not start LibreOffice: " + str(exc), file=sys.stderr)
+            return 1
+        if converted.returncode:
+            detail = converted.stderr.strip() or converted.stdout.strip() or f"exit code {converted.returncode}"
+            print("LibreOffice slideshow conversion failed: " + detail, file=sys.stderr)
+            return 1
+        try:
+            with open(converted_path, "rb") as output:
+                valid = output.read(5) == b"%PDF-"
+        except OSError:
+            valid = False
+        if not valid:
+            detail = converted.stderr.strip() or converted.stdout.strip()
+            print("LibreOffice did not produce a valid PDF" + (": " + detail if detail else ""), file=sys.stderr)
+            return 1
+        os.replace(converted_path, out_path)
+    return 0
 
 
 def main(argv):
@@ -60,34 +110,12 @@ def main(argv):
         return code
 
     if project_type == "slideshow":
-        pptx_path = out_path + ".pptx"
-        if not os.path.isfile(pptx_path):
-            print("slideshow script did not create " + pptx_path, file=sys.stderr)
+        expected = (".slides.json", ".pptx", ".manifest.json", ".cover.png")
+        missing = [out_path + suffix for suffix in expected if not os.path.isfile(out_path + suffix)]
+        if missing:
+            print("slideshow script did not create required artifact(s): " + ", ".join(missing), file=sys.stderr)
             return 1
-        office = shutil.which("libreoffice") or shutil.which("soffice")
-        if office is None:
-            print("slideshow PDF conversion unavailable: libreoffice is not installed", file=sys.stderr)
-            return 1
-        try:
-            with tempfile.TemporaryDirectory(prefix="pdf-editor-office-") as profile_dir:
-                profile = Path(profile_dir).as_uri()
-                cmd = [office, "-env:UserInstallation=" + profile, "--headless", "--convert-to", "pdf", "--outdir", os.path.dirname(out_path), pptx_path]
-                converted = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20, check=False)
-        except subprocess.TimeoutExpired:
-            print("LibreOffice slideshow conversion timed out after 20 seconds", file=sys.stderr)
-            return 1
-        except OSError as exc:
-            print("could not start LibreOffice: " + str(exc), file=sys.stderr)
-            return 1
-        if converted.returncode:
-            message = converted.stderr.strip() or converted.stdout.strip() or "LibreOffice exited with an error"
-            print("could not convert slideshow to PDF: " + message, file=sys.stderr)
-            return 1
-        generated_pdf = os.path.join(os.path.dirname(out_path), os.path.basename(out_path) + ".pdf")
-        if not os.path.isfile(generated_pdf):
-            print("LibreOffice did not create " + generated_pdf, file=sys.stderr)
-            return 1
-        os.replace(generated_pdf, out_path)
+        return convert_slideshow(out_path)
     return 0
 
 

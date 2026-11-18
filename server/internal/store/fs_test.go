@@ -29,7 +29,7 @@ func TestFSRestartAndStaleEdit(t *testing.T) {
 	if err != nil || v.Version != 2 {
 		t.Fatalf("commit: %+v %v", v, err)
 	}
-	if err := first.RecordOutput(doc.ID, 2, "pdf/"+doc.ID+"/versions/2/pdf_render.pdf", "pdf/"+doc.ID+"/versions/2/cover.png", "", `{"page_size":[1,1],"elements":[]}`); err != nil {
+	if err := first.RecordOutput(doc.ID, 2, Output{PDFKey: "pdf/" + doc.ID + "/versions/2/pdf_render.pdf", CoverKey: "pdf/" + doc.ID + "/versions/2/cover.png", Manifest: `{"page_size":[1,1],"elements":[]}`}); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := storage.NewDriverFS(root)
@@ -64,7 +64,7 @@ func TestFSProjectTypeAndPPTXKeyPersist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := first.RecordOutput(doc.ID, 1, "pdf/key", "cover/key", "pptx/key", `{"page_size":[1,1],"elements":[]}`); err != nil {
+	if err := first.RecordOutput(doc.ID, 1, Output{PDFKey: "pdf/key", CoverKey: "cover/key", PPTXKey: "pptx/key", SlidesKey: "slides/key", Manifest: `{"page_size":[1,1],"elements":[]}`}); err != nil {
 		t.Fatal(err)
 	}
 	reopened := NewFS(driver)
@@ -72,8 +72,34 @@ func TestFSProjectTypeAndPPTXKeyPersist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Type != TypeSlideshow || loaded.Current().PPTXKey != "pptx/key" {
+	if loaded.Type != TypeSlideshow || loaded.Current().PPTXKey != "pptx/key" || loaded.Current().SlidesKey != "slides/key" {
 		t.Fatalf("persisted project metadata: %+v", loaded)
+	}
+}
+
+func TestRecordOutputPreservesLegacyPDFWhenBackfillingSlides(t *testing.T) {
+	driver, err := storage.NewDriverFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := NewFS(driver)
+	doc, err := st.CreateProject("deck", "legacy-slides", "Deck", TypeSlideshow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPDF := "pdf/" + doc.ID + "/versions/1/pdf_render.pdf"
+	if err := st.RecordOutput(doc.ID, 1, Output{PDFKey: legacyPDF, CoverKey: "cover", PPTXKey: "pptx", Manifest: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordOutput(doc.ID, 1, Output{CoverKey: "cover", PPTXKey: "pptx", SlidesKey: "slides", Manifest: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := st.Get(doc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Current().PDFKey != legacyPDF || updated.Current().SlidesKey != "slides" {
+		t.Fatalf("legacy output after backfill: %+v", updated.Current())
 	}
 }
 

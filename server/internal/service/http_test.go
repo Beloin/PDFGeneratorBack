@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -37,7 +38,10 @@ func testService(t *testing.T, shell string) (*Service, *storage.DriverFS, *stor
 	return New(st, r, ws.NewHub(), driver), driver, st
 }
 
-const validRender = "printf '%s' '%PDF-1.4' > \"$2\"\nprintf '%s' '{\"page_size\":[1,1],\"elements\":[]}' > \"$2.manifest.json\"\nif [ \"$4\" = slideshow ]; then printf 'pptx' > \"$2.pptx\"; fi\n"
+const validRender = "printf '%s' '%PDF-1.4' > \"$2\"\nprintf '%s' '{\"page_size\":[1,1],\"elements\":[]}' > \"$2.manifest.json\"\nif [ \"$4\" = slideshow ]; then\n" +
+	"python3 -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1], \"w\"); z.writestr(\"ppt/presentation.xml\", \"<p:presentation/>\"); z.close()' \"$2.pptx\"\n" +
+	"cat > \"$2.slides.json\" <<'JSON'\n{\"schema_version\":1,\"width\":960,\"height\":540,\"font_family\":\"Vera\",\"fonts\":{\"regular\":\"Vera.ttf\",\"bold\":\"VeraBd.ttf\"},\"slides\":[{\"page\":1,\"background\":\"#FFFFFF\",\"elements\":[{\"id\":\"image\",\"type\":\"image\",\"x\":0,\"y\":0,\"width\":10,\"height\":10,\"source_line\":1,\"asset_name\":\"photo.png\"}]}]}\nJSON\n" +
+	"printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC' | base64 -d > \"$2.cover.png\"\nfi\n"
 
 func request(t *testing.T, svc *Service, method, target, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -159,14 +163,31 @@ func TestProjectTypeSelectionAndTemplateFilter(t *testing.T) {
 		if response["type"] != test.wantType || response["template"] != test.wantTemplate {
 			t.Fatalf("type metadata for %s: %#v", test.body, response)
 		}
+		if response["pdf_url"] == nil {
+			t.Fatalf("missing pdf_url for %s: %#v", test.body, response)
+		}
 		_, hasPPTX := response["pptx_url"]
 		if hasPPTX != (test.wantType == store.TypeSlideshow) {
 			t.Fatalf("pptx_url for %s: %#v", test.body, response)
 		}
 		if test.wantType == store.TypeSlideshow {
+			scene := request(t, svc, "GET", response["slides_url"].(string), "")
+			var sceneJSON map[string]any
+			if scene.Code != http.StatusOK || json.Unmarshal(scene.Body.Bytes(), &sceneJSON) != nil {
+				t.Fatalf("slide scene: %d %s", scene.Code, scene.Body.String())
+			}
+			fonts, ok := sceneJSON["fonts"].(map[string]any)
+			if !ok || fonts["regular_url"] != "/slides/fonts/regular.ttf" || fonts["bold_url"] != "/slides/fonts/bold.ttf" {
+				t.Fatalf("scene fonts: %#v", sceneJSON["fonts"])
+			}
+			slides := sceneJSON["slides"].([]any)
+			elements := slides[0].(map[string]any)["elements"].([]any)
+			if elements[0].(map[string]any)["image_url"] != "/docs/"+response["doc_id"].(string)+"/images/photo.png?version=1" {
+				t.Fatalf("image URL: %#v", elements[0])
+			}
 			pptxURL := response["pptx_url"].(string)
 			pptx := request(t, svc, "GET", pptxURL, "")
-			if pptx.Code != http.StatusOK || pptx.Body.String() != "pptx" || pptx.Header().Get("Content-Type") != "application/vnd.openxmlformats-officedocument.presentationml.presentation" {
+			if pptx.Code != http.StatusOK || !bytes.HasPrefix(pptx.Body.Bytes(), []byte("PK")) || pptx.Header().Get("Content-Type") != "application/vnd.openxmlformats-officedocument.presentationml.presentation" {
 				t.Fatalf("pptx download: %d %q %q", pptx.Code, pptx.Body.String(), pptx.Header().Get("Content-Type"))
 			}
 			id := response["doc_id"].(string)
@@ -178,7 +199,7 @@ func TestProjectTypeSelectionAndTemplateFilter(t *testing.T) {
 				t.Fatal(err)
 			}
 			rebuilt := request(t, svc, "GET", pptxURL, "")
-			if rebuilt.Code != http.StatusOK || rebuilt.Body.String() != "pptx" {
+			if rebuilt.Code != http.StatusOK || !bytes.HasPrefix(rebuilt.Body.Bytes(), []byte("PK")) {
 				t.Fatalf("rebuilt pptx: %d %q", rebuilt.Code, rebuilt.Body.String())
 			}
 		}
@@ -187,6 +208,32 @@ func TestProjectTypeSelectionAndTemplateFilter(t *testing.T) {
 		if got := request(t, svc, "POST", "/docs", body); got.Code != http.StatusBadRequest {
 			t.Fatalf("invalid type %s: %d %s", body, got.Code, got.Body.String())
 		}
+	}
+}
+
+func TestSlideshowPDFServesSavedOutputAndAttemptsLegacyRebuild(t *testing.T) {
+	svc, driver, st := testService(t, "exit 1\n")
+	doc, err := st.CreateProject("deck", "slideshow-pptx", "Deck", store.TypeSlideshow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pdfKey := "pdf/" + doc.ID + "/versions/1/pdf_render.pdf"
+	if err := driver.Put(context.Background(), pdfKey, []byte("%PDF-legacy")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordOutput(doc.ID, 1, store.Output{PDFKey: pdfKey, Manifest: `{"page_size":[1,1],"elements":[]}`}); err != nil {
+		t.Fatal(err)
+	}
+	got := request(t, svc, "GET", "/docs/"+doc.ID+"/pdf?version=1", "")
+	if got.Code != http.StatusOK || got.Body.String() != "%PDF-legacy" {
+		t.Fatalf("saved PDF: %d %s", got.Code, got.Body.String())
+	}
+	if err := driver.Delete(context.Background(), pdfKey); err != nil {
+		t.Fatal(err)
+	}
+	got = request(t, svc, "GET", "/docs/"+doc.ID+"/pdf?version=1", "")
+	if got.Code != http.StatusInternalServerError || strings.Contains(got.Body.String(), "NO_PDF_OUTPUT") {
+		t.Fatalf("legacy PDF rebuild response: %d %s", got.Code, got.Body.String())
 	}
 }
 
